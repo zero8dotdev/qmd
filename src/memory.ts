@@ -64,6 +64,14 @@ export type MemorySearchResult = {
   source: "fts" | "vec";
 };
 
+type RecallTimings = {
+  ftsMs: number;
+  vecMs: number;
+  fuseMs: number;
+  dedupeMs: number;
+  totalMs: number;
+};
+
 // =============================================================================
 // Schema Initialization
 // =============================================================================
@@ -102,6 +110,7 @@ export function initializeMemoryTables(db: Database): void {
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_messages_session ON memory_messages(session_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_messages_hash ON memory_messages(hash)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_sessions_active ON memory_sessions(active, id)`);
 
   // FTS5 for memory search
   db.exec(`
@@ -263,19 +272,26 @@ export async function addMessage(
   const now = new Date().toISOString();
   const hash = await hashContent(content);
 
-  // Ensure session exists (createSession may generate a new ID for "new")
-  let session = getSession(db, sessionId);
-  if (!session) {
-    session = createSession(db, sessionId, options.title || "");
-  } else if (options.title && !session.title) {
-    db.prepare(`UPDATE memory_sessions SET title = ? WHERE id = ?`).run(
-      options.title,
-      sessionId
-    );
+  // Preserve "new" behavior, which generates an ID.
+  let resolvedSessionId = sessionId;
+  if (sessionId === "new") {
+    resolvedSessionId = crypto.randomUUID().slice(0, 8);
   }
 
-  // Use the resolved session ID (may differ from input if "new" was passed)
-  const resolvedSessionId = session.id;
+  // Ensure session exists without a pre-read on every message.
+  db.prepare(
+    `INSERT OR IGNORE INTO memory_sessions (id, title, created_at, updated_at, active)
+     VALUES (?, ?, ?, ?, 1)`
+  ).run(resolvedSessionId, options.title || "", now, now);
+
+  // If title is provided later, fill it only when current title is empty.
+  if (options.title) {
+    db.prepare(
+      `UPDATE memory_sessions
+       SET title = ?
+       WHERE id = ? AND (title = '' OR title IS NULL)`
+    ).run(options.title, resolvedSessionId);
+  }
 
   const metadataStr = options.metadata
     ? JSON.stringify(options.metadata)
@@ -347,24 +363,37 @@ export function searchMemoryFTS(
 ): MemorySearchResult[] {
   const ftsQuery = buildMemoryFTS5Query(query);
   if (!ftsQuery) return [];
+  const candidateLimit = Math.max(limit * 3, limit);
 
+  // Rank candidate rowids in FTS first, then join to payload tables.
+  // This keeps the expensive bm25 ordering on the smallest possible row shape.
   const sql = `
+    WITH ranked AS (
+      SELECT
+        rowid,
+        bm25(memory_fts, 5.0, 1.0, 1.0) as bm25_score
+      FROM memory_fts
+      WHERE memory_fts MATCH ?
+      ORDER BY bm25_score ASC
+      LIMIT ?
+    )
     SELECT
       m.session_id,
       s.title as session_title,
       m.id as message_id,
       m.role,
       m.content,
-      bm25(memory_fts, 5.0, 1.0, 1.0) as bm25_score
-    FROM memory_fts f
-    JOIN memory_messages m ON m.id = f.rowid
+      r.bm25_score
+    FROM ranked r
+    JOIN memory_messages m ON m.id = r.rowid
     JOIN memory_sessions s ON s.id = m.session_id
-    WHERE memory_fts MATCH ? AND s.active = 1
-    ORDER BY bm25_score ASC
+    WHERE s.active = 1
+    ORDER BY r.bm25_score ASC
     LIMIT ?
   `;
 
-  const rows = db.prepare(sql).all(ftsQuery, limit) as {
+  const stmt = getMemoryFtsStmt(db, sql);
+  const rows = stmt.all(ftsQuery, candidateLimit, limit) as {
     session_id: string;
     session_title: string;
     message_id: number;
@@ -383,6 +412,17 @@ export function searchMemoryFTS(
     score: 1 / (1 + Math.abs(row.bm25_score)),
     source: "fts" as const,
   }));
+}
+
+const memoryFtsStmtCache = new WeakMap<Database, ReturnType<Database["prepare"]>>();
+
+function getMemoryFtsStmt(db: Database, sql: string) {
+  let stmt = memoryFtsStmtCache.get(db);
+  if (!stmt) {
+    stmt = db.prepare(sql);
+    memoryFtsStmtCache.set(db, stmt);
+  }
+  return stmt;
 }
 
 /**
@@ -654,16 +694,22 @@ export async function recallMemories(
     maxTokens?: number;
   } = {}
 ): Promise<{ results: MemorySearchResult[]; synthesis?: string }> {
+  const startedAt = performance.now();
+  const shouldTraceRecall = process.env.SMRITI_BENCH_TRACE === "1";
   const limit = options.limit ?? 10;
 
   // Run FTS and vector search
+  const ftsStartedAt = performance.now();
   const ftsResults = searchMemoryFTS(db, query, limit);
+  const ftsMs = performance.now() - ftsStartedAt;
   let vecResults: MemorySearchResult[] = [];
+  const vecStartedAt = performance.now();
   try {
     vecResults = await searchMemoryVec(db, query, limit);
   } catch {
     // Vector search may fail if no embeddings exist
   }
+  const vecMs = performance.now() - vecStartedAt;
 
   // Convert to RankedResult format for RRF
   const toRanked = (results: MemorySearchResult[]): RankedResult[] =>
@@ -676,24 +722,33 @@ export async function recallMemories(
     }));
 
   // Fuse results with RRF
+  const fuseStartedAt = performance.now();
   const fused = reciprocalRankFusion(
     [toRanked(ftsResults), toRanked(vecResults)],
     [1.0, 1.0]
   );
+  const fuseMs = performance.now() - fuseStartedAt;
 
   // Deduplicate by session, keeping best score per session
+  const dedupeStartedAt = performance.now();
   const sessionSeen = new Map<string, boolean>();
   const dedupedResults: MemorySearchResult[] = [];
+  const originalByKey = new Map<string, MemorySearchResult>();
+  for (const result of ftsResults) {
+    originalByKey.set(`${result.session_id}:${result.message_id}`, result);
+  }
+  for (const result of vecResults) {
+    const key = `${result.session_id}:${result.message_id}`;
+    // Prefer vector entry if both are present because it typically carries the better semantic score.
+    originalByKey.set(key, result);
+  }
 
   for (const r of fused) {
     const [sessionId] = r.file.split(":");
     if (!sessionId) continue;
 
     // Find the original result to preserve all fields
-    const original =
-      [...ftsResults, ...vecResults].find(
-        (o) => `${o.session_id}:${o.message_id}` === r.file
-      ) || null;
+    const original = originalByKey.get(r.file) ?? null;
 
     if (original && !sessionSeen.has(sessionId)) {
       sessionSeen.set(sessionId, true);
@@ -711,6 +766,7 @@ export async function recallMemories(
       });
     }
   }
+  const dedupeMs = performance.now() - dedupeStartedAt;
 
   const results = dedupedResults.slice(0, limit);
 
@@ -728,6 +784,24 @@ export async function recallMemories(
       model: options.model,
       maxTokens: options.maxTokens,
     });
+  }
+
+  if (shouldTraceRecall) {
+    const timings: RecallTimings = {
+      ftsMs,
+      vecMs,
+      fuseMs,
+      dedupeMs,
+      totalMs: performance.now() - startedAt,
+    };
+    console.error(
+      `[recall.trace] q="${query.slice(0, 64)}" ` +
+        `fts=${timings.ftsMs.toFixed(3)}ms ` +
+        `vec=${timings.vecMs.toFixed(3)}ms ` +
+        `fuse=${timings.fuseMs.toFixed(3)}ms ` +
+        `dedupe=${timings.dedupeMs.toFixed(3)}ms ` +
+        `total=${timings.totalMs.toFixed(3)}ms`
+    );
   }
 
   return { results, synthesis };
