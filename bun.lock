@@ -22,8 +22,9 @@
       "optionalDependencies": {
         "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
         "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
+        "sqlite-vec-linux-arm64": "^0.1.7-alpha.2",
         "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
-        "sqlite-vec-win32-x64": "^0.1.7-alpha.2",
+        "sqlite-vec-windows-x64": "^0.1.7-alpha.2",
       },
       "peerDependencies": {
         "typescript": "^5.9.3",
