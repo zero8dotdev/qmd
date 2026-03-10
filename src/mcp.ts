@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * QMD MCP Server - Model Context Protocol server for QMD
  *
@@ -8,19 +7,25 @@
  * Follows MCP spec 2025-06-18 for proper response types.
  */
 
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WebStandardStreamableHTTPServerTransport }
+  from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   createStore,
-  reciprocalRankFusion,
   extractSnippet,
-  DEFAULT_EMBED_MODEL,
-  DEFAULT_QUERY_MODEL,
-  DEFAULT_RERANK_MODEL,
+  addLineNumbers,
+  structuredSearch,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { RankedResult } from "./store.js";
+import type { Store, StructuredSubSearch } from "./store.js";
+import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -75,27 +80,85 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
-/**
- * Add line numbers to text content.
- * Each line becomes: "{lineNum}: {content}"
- */
-function addLineNumbers(text: string, startLine: number = 1): string {
-  const lines = text.split('\n');
-  return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
-}
-
 // =============================================================================
 // MCP Server
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
-  // Open database once at startup - keep it open for the lifetime of the server
-  const store = createStore();
+/**
+ * Build dynamic server instructions from actual index state.
+ * Injected into the LLM's system prompt via MCP initialize response —
+ * gives the LLM immediate context about what's searchable without a tool call.
+ */
+function buildInstructions(store: Store): string {
+  const status = store.getStatus();
+  const lines: string[] = [];
 
-  const server = new McpServer({
-    name: "qmd",
-    version: "1.0.0",
-  });
+  // --- What is this? ---
+  const globalCtx = getGlobalContext();
+  lines.push(`QMD is your local search engine over ${status.totalDocuments} markdown documents.`);
+  if (globalCtx) lines.push(`Context: ${globalCtx}`);
+
+  // --- What's searchable? ---
+  if (status.collections.length > 0) {
+    lines.push("");
+    lines.push("Collections (scope with `collection` parameter):");
+    for (const col of status.collections) {
+      const collConfig = getCollection(col.name);
+      const rootCtx = collConfig?.context?.[""] || collConfig?.context?.["/"];
+      const desc = rootCtx ? ` — ${rootCtx}` : "";
+      lines.push(`  - "${col.name}" (${col.documents} docs)${desc}`);
+    }
+  }
+
+  // --- Capability gaps ---
+  if (!status.hasVectorIndex) {
+    lines.push("");
+    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
+  } else if (status.needsEmbedding > 0) {
+    lines.push("");
+    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
+  }
+
+  // --- Search tool ---
+  lines.push("");
+  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde):");
+  lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
+  lines.push("  - type:'vec' — semantic vector search (meaning-based)");
+  lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
+  lines.push("");
+  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
+  lines.push("");
+  lines.push("Examples:");
+  lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
+  lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
+  lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
+  lines.push("  With intent: searches=[{type:'lex', query:'performance'}], intent='web page load times'");
+
+  // --- Retrieval workflow ---
+  lines.push("");
+  lines.push("Retrieval:");
+  lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
+  lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
+
+  // --- Non-obvious things that prevent mistakes ---
+  lines.push("");
+  lines.push("Tips:");
+  lines.push("  - File paths in results are relative to their collection.");
+  lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
+  lines.push("  - Results include a `context` field describing the content type.");
+
+  return lines.join("\n");
+}
+
+/**
+ * Create an MCP server with all QMD tools, resources, and prompts registered.
+ * Shared by both stdio and HTTP transports.
+ */
+function createMcpServer(store: Store): McpServer {
+  const server = new McpServer(
+    { name: "qmd", version: "0.9.9" },
+    { instructions: buildInstructions(store) },
+  );
 
   // ---------------------------------------------------------------------------
   // Resource: qmd://{path} - read-only access to documents by path
@@ -166,276 +229,134 @@ export async function startMcpServer(): Promise<void> {
   );
 
   // ---------------------------------------------------------------------------
-  // Prompt: query guide
+  // Tool: query (Primary search tool)
   // ---------------------------------------------------------------------------
 
-  server.registerPrompt(
-    "query",
-    {
-      title: "QMD Query Guide",
-      description: "How to effectively search your knowledge base with QMD",
-    },
-    () => ({
-      messages: [
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text: `# QMD - Quick Markdown Search
-
-QMD is your on-device search engine for markdown knowledge bases. Use it to find information across your notes, documents, and meeting transcripts.
-
-## Available Tools
-
-### 1. search (Fast keyword search)
-Best for: Finding documents with specific keywords or phrases.
-- Uses BM25 full-text search
-- Fast, no LLM required
-- Good for exact matches
-- Use \`collection\` parameter to filter to a specific collection
-
-### 2. vsearch (Semantic search)
-Best for: Finding conceptually related content even without exact keyword matches.
-- Uses vector embeddings
-- Understands meaning and context
-- Good for "how do I..." or conceptual queries
-- Use \`collection\` parameter to filter to a specific collection
-
-### 3. query (Hybrid search - highest quality)
-Best for: Important searches where you want the best results.
-- Combines keyword + semantic search
-- Expands your query with variations
-- Re-ranks results with LLM
-- Slower but most accurate
-- Use \`collection\` parameter to filter to a specific collection
-
-### 4. get (Retrieve document)
-Best for: Getting the full content of a single document you found.
-- Use the file path from search results
-- Supports line ranges: \`file.md:100\` or fromLine/maxLines parameters
-- Suggests similar files if not found
-
-### 5. multi_get (Retrieve multiple documents)
-Best for: Getting content from multiple files at once.
-- Use glob patterns: \`journals/2025-05*.md\`
-- Or comma-separated: \`file1.md, file2.md\`
-- Skips files over maxBytes (default 10KB) - use get for large files
-
-### 6. status (Index info)
-Shows collection info, document counts, and embedding status.
-
-## Resources
-
-You can also access documents directly via the \`qmd://\` URI scheme:
-- List all documents: \`resources/list\`
-- Read a document: \`resources/read\` with uri \`qmd://path/to/file.md\`
-
-## Search Strategy
-
-1. **Start with search** for quick keyword lookups
-2. **Use vsearch** when keywords aren't working or for conceptual queries
-3. **Use query** for important searches or when you need high confidence
-4. **Use get** to retrieve a single full document
-5. **Use multi_get** to batch retrieve multiple related files
-
-## Tips
-
-- Use \`minScore: 0.5\` to filter low-relevance results
-- Use \`collection: "notes"\` to search only in a specific collection
-- Check the "Context" field - it describes what kind of content the file contains
-- File paths are relative to their collection (e.g., \`pages/meeting.md\`)
-- For glob patterns, match on display_path (e.g., \`journals/2025-*.md\`)`,
-          },
-        },
-      ],
-    })
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_search (BM25 full-text)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "search",
-    {
-      title: "Search (BM25)",
-      description: "Fast keyword-based full-text search using BM25. Best for finding documents with specific words or phrases.",
-      inputSchema: {
-        query: z.string().describe("Search query - keywords or phrases to find"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      // Note: Collection filtering is now done post-search since collections are managed in YAML
-      const results = store.searchFTS(query, limit || 10)
-        .filter(r => !collection || r.collectionName === collection);
-      const filtered: SearchResultItem[] = results
-        .filter(r => r.score >= (minScore || 0))
-        .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300, r.chunkPos);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: store.getContextForFile(r.filepath),
-            snippet: addLineNumbers(snippet, line),  // Default to line numbers
-          };
-        });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_vsearch (Vector semantic search)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "vsearch",
-    {
-      title: "Vector Search (Semantic)",
-      description: "Semantic similarity search using vector embeddings. Finds conceptually related content even without exact keyword matches. Requires embeddings (run 'qmd embed' first).",
-      inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0.3).describe("Minimum relevance score 0-1 (default: 0.3)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
-      },
-    },
-    async ({ query, limit, minScore, collection }) => {
-      const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-      if (!tableExists) {
-        return {
-          content: [{ type: "text", text: "Vector index not found. Run 'qmd embed' first to create embeddings." }],
-          isError: true,
-        };
-      }
-
-      // Expand query
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
-
-      // Collect results (filter by collection after search)
-      const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; docid: string }>();
-      for (const q of queries) {
-        const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit || 10)
-          .then(results => results.filter(r => !collection || r.collectionName === collection));
-        for (const r of vecResults) {
-          const existing = allResults.get(r.filepath);
-          if (!existing || r.score > existing.score) {
-            allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, docid: r.docid });
-          }
-        }
-      }
-
-      const filtered: SearchResultItem[] = Array.from(allResults.values())
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit || 10)
-        .filter(r => r.score >= (minScore || 0.3))
-        .map(r => {
-          const { line, snippet } = extractSnippet(r.body || "", query, 300);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: store.getContextForFile(r.file),
-            snippet: addLineNumbers(snippet, line),  // Default to line numbers
-          };
-        });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
-      };
-    }
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_query (Hybrid with reranking)
-  // ---------------------------------------------------------------------------
+  const subSearchSchema = z.object({
+    type: z.enum(['lex', 'vec', 'hyde']).describe(
+      "lex = BM25 keywords (supports \"phrase\" and -negation); " +
+      "vec = semantic question; hyde = hypothetical answer passage"
+    ),
+    query: z.string().describe(
+      "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
+      "For vec: natural language question. For hyde: 50-100 word answer passage."
+    ),
+  });
 
   server.registerTool(
     "query",
     {
-      title: "Hybrid Query (Best Quality)",
-      description: "Highest quality search combining BM25 + vector + query expansion + LLM reranking. Slower but most accurate. Use for important searches.",
+      title: "Query",
+      description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
+
+## Query Types
+
+**lex** — BM25 keyword search. Fast, exact, no LLM needed.
+Full lex syntax:
+- \`term\` — prefix match ("perf" matches "performance")
+- \`"exact phrase"\` — phrase must appear verbatim
+- \`-term\` or \`-"phrase"\` — exclude documents containing this
+
+Good lex examples:
+- \`"connection pool" timeout -redis\`
+- \`"machine learning" -sports -athlete\`
+- \`handleError async typescript\`
+
+**vec** — Semantic vector search. Write a natural language question. Finds documents by meaning, not exact words.
+- \`how does the rate limiter handle burst traffic?\`
+- \`what is the tradeoff between consistency and availability?\`
+
+**hyde** — Hypothetical document. Write 50-100 words that look like the answer. Often the most powerful for nuanced topics.
+- \`The rate limiter uses a token bucket algorithm. When a client exceeds 100 req/min, subsequent requests return 429 until the window resets.\`
+
+## Strategy
+
+Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
+
+| Goal | Approach |
+|------|----------|
+| Know exact term/name | \`lex\` only |
+| Concept search | \`vec\` only |
+| Best recall | \`lex\` + \`vec\` |
+| Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
+| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
+
+## Examples
+
+Simple lookup:
+\`\`\`json
+[{ "type": "lex", "query": "CAP theorem" }]
+\`\`\`
+
+Best recall on a technical topic:
+\`\`\`json
+[
+  { "type": "lex", "query": "\\"connection pool\\" timeout -redis" },
+  { "type": "vec", "query": "why do database connections time out under load" },
+  { "type": "hyde", "query": "Connection pool exhaustion occurs when all connections are in use and new requests must wait. This typically happens under high concurrency when queries run longer than expected." }
+]
+\`\`\`
+
+Intent-aware lex (C++ performance, not sports):
+\`\`\`json
+[
+  { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
+  { "type": "vec", "query": "how to optimize C++ program performance" }
+]
+\`\`\``,
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        query: z.string().describe("Natural language query - describe what you're looking for"),
-        limit: z.number().optional().default(10).describe("Maximum number of results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Minimum relevance score 0-1 (default: 0)"),
-        collection: z.string().optional().describe("Filter to a specific collection by name"),
+        searches: z.array(subSearchSchema).min(1).max(10).describe(
+          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
+        ),
+        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
+        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        candidateLimit: z.number().optional().describe(
+          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+        ),
+        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        intent: z.string().optional().describe(
+          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
+        ),
       },
     },
-    async ({ query, limit, minScore, collection }) => {
-      // Expand query
-      const queries = await store.expandQuery(query, DEFAULT_QUERY_MODEL);
+    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+      // Map to internal format
+      const subSearches: StructuredSubSearch[] = searches.map(s => ({
+        type: s.type,
+        query: s.query,
+      }));
 
-      // Collect ranked lists (filter by collection after search)
-      const rankedLists: RankedResult[][] = [];
-      const docidMap = new Map<string, string>(); // filepath -> docid
-      const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+      // Use default collections if none specified
+      const effectiveCollections = collections ?? getDefaultCollectionNames();
 
-      for (const q of queries) {
-        const ftsResults = store.searchFTS(q, 20)
-          .filter(r => !collection || r.collectionName === collection);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-        }
-        if (hasVectors) {
-          const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, 20)
-            .then(results => results.filter(r => !collection || r.collectionName === collection));
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
-          }
-        }
-      }
+      const results = await structuredSearch(store, subSearches, {
+        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+        limit,
+        minScore,
+        candidateLimit,
+        intent,
+      });
 
-      // RRF fusion
-      const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-      const fused = reciprocalRankFusion(rankedLists, weights);
-      const candidates = fused.slice(0, 30);
+      // Use first lex or vec query for snippet extraction
+      const primaryQuery = searches.find(s => s.type === 'lex')?.query
+        || searches.find(s => s.type === 'vec')?.query
+        || searches[0]?.query || "";
 
-      // Rerank
-      const reranked = await store.rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL
-      );
-
-      // Blend scores
-      const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
-      const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-      const filtered: SearchResultItem[] = reranked.map(r => {
-        const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-        let rrfWeight: number;
-        if (rrfRank <= 3) rrfWeight = 0.75;
-        else if (rrfRank <= 10) rrfWeight = 0.60;
-        else rrfWeight = 0.40;
-        const rrfScore = 1 / rrfRank;
-        const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-        const candidate = candidateMap.get(r.file);
-        const { line, snippet } = extractSnippet(candidate?.body || "", query, 300);
+      const filtered: SearchResultItem[] = results.map(r => {
+        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
         return {
-          docid: `#${docidMap.get(r.file) || ""}`,
-          file: candidate?.displayPath || "",
-          title: candidate?.title || "",
-          score: Math.round(blendedScore * 100) / 100,
-          context: store.getContextForFile(r.file),
-          snippet: addLineNumbers(snippet, line),  // Default to line numbers
+          docid: `#${r.docid}`,
+          file: r.displayPath,
+          title: r.title,
+          score: Math.round(r.score * 100) / 100,
+          context: r.context,
+          snippet: addLineNumbers(snippet, line),
         };
-      }).filter(r => r.score >= (minScore || 0)).slice(0, limit || 10);
+      });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
+        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
         structuredContent: { results: filtered },
       };
     }
@@ -450,6 +371,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Get Document",
       description: "Retrieve the full content of a document by its file path or docid. Use paths or docids (#abc123) from search results. Suggests similar files if not found.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         file: z.string().describe("File path or docid from search results (e.g., 'pages/meeting.md', '#abc123', or 'pages/meeting.md:100' to start at line 100)"),
         fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
@@ -514,6 +436,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Multi-Get Documents",
       description: "Retrieve multiple documents by glob pattern (e.g., 'journals/2025-05*.md') or comma-separated list. Skips files larger than maxBytes.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
         maxLines: z.number().optional().describe("Maximum lines per file"),
@@ -586,6 +509,7 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     {
       title: "Index Status",
       description: "Show the status of the QMD index: collections, document counts, and health information.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {},
     },
     async () => {
@@ -610,17 +534,293 @@ You can also access documents directly via the \`qmd://\` URI scheme:
     }
   );
 
-  // ---------------------------------------------------------------------------
-  // Connect via stdio
-  // ---------------------------------------------------------------------------
+  return server;
+}
 
+// =============================================================================
+// Transport: stdio (default)
+// =============================================================================
+
+export async function startMcpServer(): Promise<void> {
+  const store = createStore();
+  const server = createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
 
-  // Note: Database stays open - it will be closed when the process exits
+// =============================================================================
+// Transport: Streamable HTTP
+// =============================================================================
+
+export type HttpServerHandle = {
+  httpServer: import("http").Server;
+  port: number;
+  stop: () => Promise<void>;
+};
+
+/**
+ * Start MCP server over Streamable HTTP (JSON responses, no SSE).
+ * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ */
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+  const store = createStore();
+
+  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
+  // The store is shared — it's stateless SQLite, safe for concurrent access.
+  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+
+  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sessionId: string) => {
+        sessions.set(sessionId, transport);
+        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
+      },
+    });
+    const server = createMcpServer(store);
+    await server.connect(transport);
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+      }
+    };
+
+    return transport;
+  }
+
+  const startTime = Date.now();
+  const quiet = options?.quiet ?? false;
+
+  /** Format timestamp for request logging */
+  function ts(): string {
+    return new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
+  }
+
+  /** Extract a human-readable label from a JSON-RPC body */
+  function describeRequest(body: any): string {
+    const method = body?.method ?? "unknown";
+    if (method === "tools/call") {
+      const tool = body.params?.name ?? "?";
+      const args = body.params?.arguments;
+      // Show query string if present, truncated
+      if (args?.query) {
+        const q = String(args.query).slice(0, 80);
+        return `tools/call ${tool} "${q}"`;
+      }
+      if (args?.path) return `tools/call ${tool} ${args.path}`;
+      if (args?.pattern) return `tools/call ${tool} ${args.pattern}`;
+      return `tools/call ${tool}`;
+    }
+    return method;
+  }
+
+  function log(msg: string): void {
+    if (!quiet) console.error(msg);
+  }
+
+  // Helper to collect request body
+  async function collectBody(req: IncomingMessage): Promise<string> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks).toString();
+  }
+
+  const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
+    const reqStart = Date.now();
+    const pathname = nodeReq.url || "/";
+
+    try {
+      if (pathname === "/health" && nodeReq.method === "GET") {
+        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(body);
+        log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // REST endpoint: POST /search — structured search without MCP protocol
+      // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
+      if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const params = JSON.parse(rawBody);
+        
+        // Validate required fields
+        if (!params.searches || !Array.isArray(params.searches)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
+          return;
+        }
+
+        // Map to internal format
+        const subSearches: StructuredSubSearch[] = params.searches.map((s: any) => ({
+          type: s.type as 'lex' | 'vec' | 'hyde',
+          query: String(s.query || ""),
+        }));
+
+        // Use default collections if none specified
+        const effectiveCollections = params.collections ?? getDefaultCollectionNames();
+
+        const results = await structuredSearch(store, subSearches, {
+          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          limit: params.limit ?? 10,
+          minScore: params.minScore ?? 0,
+          candidateLimit: params.candidateLimit,
+        });
+
+        // Use first lex or vec query for snippet extraction
+        const primaryQuery = params.searches.find((s: any) => s.type === 'lex')?.query
+          || params.searches.find((s: any) => s.type === 'vec')?.query
+          || params.searches[0]?.query || "";
+
+        const formatted = results.map(r => {
+          const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+          return {
+            docid: `#${r.docid}`,
+            file: r.displayPath,
+            title: r.title,
+            score: Math.round(r.score * 100) / 100,
+            context: r.context,
+            snippet: addLineNumbers(snippet, line),
+          };
+        });
+
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ results: formatted }));
+        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      if (pathname === "/mcp" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const body = JSON.parse(rawBody);
+        const label = describeRequest(body);
+        const url = `http://localhost:${port}${pathname}`;
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(nodeReq.headers)) {
+          if (typeof v === "string") headers[k] = v;
+        }
+
+        // Route to existing session or create new one on initialize
+        const sessionId = headers["mcp-session-id"];
+        let transport: WebStandardStreamableHTTPServerTransport;
+
+        if (sessionId) {
+          const existing = sessions.get(sessionId);
+          if (!existing) {
+            nodeRes.writeHead(404, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32001, message: "Session not found" },
+              id: body?.id ?? null,
+            }));
+            return;
+          }
+          transport = existing;
+        } else if (isInitializeRequest(body)) {
+          transport = await createSession();
+        } else {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: Missing session ID" },
+            id: body?.id ?? null,
+          }));
+          return;
+        }
+
+        const request = new Request(url, { method: "POST", headers, body: rawBody });
+        const response = await transport.handleRequest(request, { parsedBody: body });
+
+        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+        nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      if (pathname === "/mcp") {
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(nodeReq.headers)) {
+          if (typeof v === "string") headers[k] = v;
+        }
+
+        // GET/DELETE must have a valid session
+        const sessionId = headers["mcp-session-id"];
+        if (!sessionId) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: Missing session ID" },
+            id: null,
+          }));
+          return;
+        }
+        const transport = sessions.get(sessionId);
+        if (!transport) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32001, message: "Session not found" },
+            id: null,
+          }));
+          return;
+        }
+
+        const url = `http://localhost:${port}${pathname}`;
+        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
+        const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
+        const response = await transport.handleRequest(request);
+        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
+        nodeRes.end(Buffer.from(await response.arrayBuffer()));
+        return;
+      }
+
+      nodeRes.writeHead(404);
+      nodeRes.end("Not Found");
+    } catch (err) {
+      console.error("HTTP handler error:", err);
+      nodeRes.writeHead(500);
+      nodeRes.end("Internal Server Error");
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.on("error", reject);
+    httpServer.listen(port, "localhost", () => resolve());
+  });
+
+  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
+
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    for (const transport of sessions.values()) {
+      await transport.close();
+    }
+    sessions.clear();
+    httpServer.close();
+    store.close();
+    await disposeDefaultLlamaCpp();
+  };
+
+  process.on("SIGTERM", async () => {
+    console.error("Shutting down (SIGTERM)...");
+    await stop();
+    process.exit(0);
+  });
+  process.on("SIGINT", async () => {
+    console.error("Shutting down (SIGINT)...");
+    await stop();
+    process.exit(0);
+  });
+
+  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  return { httpServer, port: actualPort, stop };
 }
 
 // Run if this is the main module
-if (import.meta.main) {
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/mcp.ts") || process.argv[1]?.endsWith("/mcp.js")) {
   startMcpServer().catch(console.error);
 }

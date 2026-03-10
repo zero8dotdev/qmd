@@ -4,18 +4,28 @@ An on-device search engine for everything you need to remember. Index your markd
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
+![QMD Architecture](assets/qmd-architecture.png)
+
+You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
+
 ## Quick Start
 
 ```sh
-# Install globally
-bun install -g https://github.com/tobi/qmd
+# Install globally (Node or Bun)
+npm install -g @tobilu/qmd
+# or
+bun install -g @tobilu/qmd
+
+# Or run directly
+npx @tobilu/qmd ...
+bunx @tobilu/qmd ...
 
 # Create collections for your notes, docs, and meeting transcripts
 qmd collection add ~/notes --name notes
 qmd collection add ~/Documents/meetings --name meetings
 qmd collection add ~/work/docs --name docs
 
-# Add context to help with search results
+# Add context to help with search results, each piece of context will be returned when matching sub documents are returned. This works as a tree. This is the key feature of QMD as it allows LLMs to make much better contextual choices when selecting documents. Don't sleep on it!
 qmd context add qmd://notes "Personal notes and ideas"
 qmd context add qmd://meetings "Meeting transcripts and notes"
 qmd context add qmd://docs "Work documentation"
@@ -65,8 +75,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 
 **Tools exposed:**
 - `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vsearch` - Semantic vector search (supports collection filter)
-- `qmd_query` - Hybrid search with reranking (supports collection filter)
+- `qmd_vector_search` - Semantic vector search (supports collection filter)
+- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
 - `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
 - `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
 - `qmd_status` - Index health and collection info
@@ -87,8 +97,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude marketplace add tobi/qmd
-claude plugin add qmd@qmd
+claude plugin marketplace add tobi/qmd
+claude plugin install qmd@qmd
 ```
 
 Or configure MCP manually in `~/.claude/settings.json`:
@@ -103,6 +113,104 @@ Or configure MCP manually in `~/.claude/settings.json`:
   }
 }
 ```
+
+#### HTTP Transport
+
+By default, QMD's MCP server uses stdio (launched as a subprocess by each client). For a shared, long-lived server that avoids repeated model loading, use the HTTP transport:
+
+```sh
+# Foreground (Ctrl-C to stop)
+qmd mcp --http                    # localhost:8181
+qmd mcp --http --port 8080        # custom port
+
+# Background daemon
+qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid
+qmd mcp stop                      # stop via PID file
+qmd status                        # shows "MCP: running (PID ...)" when active
+```
+
+The HTTP server exposes two endpoints:
+- `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `GET /health` — liveness check with uptime
+
+LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+
+Point any MCP client at `http://localhost:8181/mcp` to connect.
+
+### SDK / Library Usage
+
+Use QMD as a library in your own Node.js or Bun applications:
+
+```sh
+npm install @tobilu/qmd
+```
+
+```typescript
+import { createStore } from '@tobilu/qmd'
+
+// Create a store with inline config (no config file needed)
+const store = createStore({
+  dbPath: './my-index.sqlite',
+  config: {
+    collections: {
+      docs: { path: '/path/to/docs', pattern: '**/*.md' },
+      notes: { path: '/path/to/notes', pattern: '**/*.md' },
+    },
+  },
+})
+
+// Or reference a YAML config file
+const store2 = createStore({
+  dbPath: './my-index.sqlite',
+  configPath: './qmd.yml',
+})
+```
+
+**Search & retrieval:**
+
+```typescript
+// Hybrid search: BM25 + vector + query expansion + LLM reranking (best quality)
+const results = await store.query("authentication flow", { limit: 5 })
+
+// Fast BM25 keyword search (no LLM, synchronous)
+const keywords = store.search("auth middleware", { limit: 10 })
+
+// Structured search with pre-expanded queries (for LLM callers)
+const structured = await store.structuredSearch([
+  { type: 'lex', query: 'authentication' },
+  { type: 'vec', query: 'how users log in' },
+], { limit: 5 })
+
+// Get a document by path or docid
+const doc = store.get("docs/readme.md")
+const byId = store.get("#abc123")
+
+// Get multiple documents by glob
+const { docs, errors } = store.multiGet("docs/**/*.md")
+```
+
+**Collection & context management:**
+
+```typescript
+// Add a collection
+store.addCollection("myapp", { path: "/src/myapp", pattern: "**/*.ts" })
+
+// Add context (improves search relevance)
+store.addContext("myapp", "/auth", "Authentication and session management")
+store.setGlobalContext("Internal engineering documentation")
+
+// List everything
+store.listCollections()
+store.listContexts()
+```
+
+**Lifecycle:**
+
+```typescript
+store.close()
+```
+
+The SDK requires explicit `dbPath` and config — no defaults are assumed. This makes it safe to embed in any application without side effects.
 
 ## Architecture
 
@@ -206,6 +314,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### System Requirements
 
+- **Node.js** >= 22
 - **Bun** >= 1.0.0
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
@@ -218,27 +327,49 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
+| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
+### Custom Embedding Model
+
+Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
+This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
+`embeddinggemma-300M` has limited coverage.
+
+```sh
+# Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
+export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf"
+
+# After changing the model, re-embed all collections:
+qmd embed -f
+```
+
+Supported model families:
+- **embeddinggemma** (default) — English-optimized, small footprint
+- **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
+
+> **Note:** When switching embedding models, you must re-index with `qmd embed -f`
+> since vectors are not cross-compatible between models. The prompt format is
+> automatically adjusted for each model family.
+
 ## Installation
 
 ```sh
-bun install -g github:tobi/qmd
+npm install -g @tobilu/qmd
+# or
+bun install -g @tobilu/qmd
 ```
-
-Make sure `~/.bun/bin` is in your PATH.
 
 ### Development
 
 ```sh
 git clone https://github.com/tobi/qmd
 cd qmd
-bun install
-bun link
+npm install
+npm link
 ```
 
 ## Usage
@@ -269,7 +400,7 @@ qmd ls notes/subfolder
 ### Generate Vector Embeddings
 
 ```sh
-# Embed all indexed documents (800 tokens/chunk, 15% overlap)
+# Embed all indexed documents (900 tokens/chunk, 15% overlap)
 qmd embed
 
 # Force re-embed everything
@@ -332,6 +463,7 @@ qmd query "user authentication"
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
+--explain          # Include retrieval score traces (query, JSON/CLI output)
 --index <name>     # Use named index
 
 # Output formats (for search and multi-get)
@@ -394,6 +526,9 @@ qmd search --md --full "error handling"
 # JSON output for scripting
 qmd query --json "quarterly reports"
 
+# Inspect how each result was scored (RRF + rerank blend)
+qmd query --json --explain "quarterly reports"
+
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
 ```
@@ -446,7 +581,7 @@ collections     -- Indexed directories with name and glob patterns
 path_contexts   -- Context descriptions by virtual path (qmd://...)
 documents       -- Markdown content with metadata and docid (6-char hash)
 documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos, 800 tokens each)
+content_vectors -- Embedding chunks (hash, seq, pos, 900 tokens each)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
 llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 ```
@@ -476,17 +611,48 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 
 ### Embedding Flow
 
-Documents are chunked into 800-token pieces with 15% overlap:
+Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
-Document ──► Chunk (800 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
-                │                    "title | text"        embedBatch()
+Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
+                │                           "title | text"        embedBatch()
                 │
                 └─► Chunks stored with:
                     - hash: document hash
                     - seq: chunk sequence (0, 1, 2...)
                     - pos: character position in original
 ```
+
+### Smart Chunking
+
+Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to find natural markdown break points. This keeps semantic units (sections, paragraphs, code blocks) together.
+
+**Break Point Scores:**
+
+| Pattern | Score | Description |
+|---------|-------|-------------|
+| `# Heading` | 100 | H1 - major section |
+| `## Heading` | 90 | H2 - subsection |
+| `### Heading` | 80 | H3 |
+| `#### Heading` | 70 | H4 |
+| `##### Heading` | 60 | H5 |
+| `###### Heading` | 50 | H6 |
+| ` ``` ` | 80 | Code block boundary |
+| `---` / `***` | 60 | Horizontal rule |
+| Blank line | 20 | Paragraph boundary |
+| `- item` / `1. item` | 5 | List item |
+| Line break | 1 | Minimal break |
+
+**Algorithm:**
+
+1. Scan document for all break points with scores
+2. When approaching the 900-token target, search a 200-token window before the cutoff
+3. Score each break point: `finalScore = baseScore × (1 - (distance/window)² × 0.7)`
+4. Cut at the highest-scoring break point
+
+The squared distance decay means a heading 200 tokens back (score ~30) still beats a simple line break at the target (score 1), but a closer heading wins over a distant one.
+
+**Code Fence Protection:** Break points inside code blocks are ignored—code stays together. If a code block exceeds the chunk size, it's kept whole when possible.
 
 ### Query Flow (Hybrid)
 
