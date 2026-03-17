@@ -23,18 +23,37 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
 // =============================================================================
 
 /**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma.
+ * Detect if a model URI uses the Qwen3-Embedding format.
+ * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
  */
-export function formatQueryForEmbedding(query: string): string {
+export function isQwen3EmbeddingModel(modelUri: string): boolean {
+  return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
+}
+
+/**
+ * Format a query for embedding.
+ * Uses nomic-style task prefix format for embeddinggemma (default).
+ * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ */
+export function formatQueryForEmbedding(query: string, modelUri?: string): string {
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  if (isQwen3EmbeddingModel(uri)) {
+    return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
+  }
   return `task: search result | query: ${query}`;
 }
 
 /**
  * Format a document for embedding.
- * Uses nomic-style format with title and text fields.
+ * Uses nomic-style format with title and text fields (default).
+ * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
-export function formatDocForEmbedding(text: string, title?: string): string {
+export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  if (isQwen3EmbeddingModel(uri)) {
+    // Qwen3-Embedding: documents are raw text, no task prefix
+    return title ? `${title}\n${text}` : text;
+  }
   return `title: ${title || "none"} | text: ${text}`;
 }
 
@@ -173,10 +192,17 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+// Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
+const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL ?? "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+
+// Alternative generation models for query expansion:
+// LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
+// Use these as base for fine-tuning with configs/sft_lfm2.yaml
+export const LFM2_GENERATE_MODEL = "hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf";
+export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf";
 
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
@@ -329,6 +355,11 @@ export type LlamaCppConfig = {
   rerankModel?: string;
   modelCacheDir?: string;
   /**
+   * Context size used for query expansion generation contexts.
+   * Default: 2048. Can also be set via QMD_EXPAND_CONTEXT_SIZE.
+   */
+  expandContextSize?: number;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -350,23 +381,46 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+
+function resolveExpandContextSize(configValue?: number): number {
+  if (configValue !== undefined) {
+    if (!Number.isInteger(configValue) || configValue <= 0) {
+      throw new Error(`Invalid expandContextSize: ${configValue}. Must be a positive integer.`);
+    }
+    return configValue;
+  }
+
+  const envValue = process.env.QMD_EXPAND_CONTEXT_SIZE?.trim();
+  if (!envValue) return DEFAULT_EXPAND_CONTEXT_SIZE;
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_EXPAND_CONTEXT_SIZE="${envValue}", using default ${DEFAULT_EXPAND_CONTEXT_SIZE}.\n`
+    );
+    return DEFAULT_EXPAND_CONTEXT_SIZE;
+  }
+  return parsed;
+}
 
 export class LlamaCpp implements LLM {
+  private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
-  private embedContext: LlamaEmbeddingContext | null = null;
+  private embedContexts: LlamaEmbeddingContext[] = [];
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
-  private rerankContext: Awaited<ReturnType<LlamaModel["createRankingContext"]>> | null = null;
+  private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
 
   private embedModelUri: string;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
+  private expandContextSize: number;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
-  private embedContextCreatePromise: Promise<LlamaEmbeddingContext> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
 
@@ -384,6 +438,7 @@ export class LlamaCpp implements LLM {
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
+    this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -423,7 +478,7 @@ export class LlamaCpp implements LLM {
    * Check if any contexts are currently loaded (and therefore worth unloading on inactivity).
    */
   private hasLoadedContexts(): boolean {
-    return !!(this.embedContext || this.rerankContext);
+    return !!(this.embedContexts.length > 0 || this.rerankContexts.length > 0);
   }
 
   /**
@@ -445,14 +500,14 @@ export class LlamaCpp implements LLM {
     }
 
     // Dispose contexts first
-    if (this.embedContext) {
-      await this.embedContext.dispose();
-      this.embedContext = null;
+    for (const ctx of this.embedContexts) {
+      await ctx.dispose();
     }
-    if (this.rerankContext) {
-      await this.rerankContext.dispose();
-      this.rerankContext = null;
+    this.embedContexts = [];
+    for (const ctx of this.rerankContexts) {
+      await ctx.dispose();
     }
+    this.rerankContexts = [];
 
     // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
@@ -491,7 +546,18 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
+      const llama = await getLlama({
+        // attempt to build
+        build: "autoAttempt",
+        logLevel: LlamaLogLevel.error
+      });
+
+      if (llama.gpu === false) {
+        process.stderr.write(
+          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
+        );
+      }
+      this.llama = llama;
     }
     return this.llama;
   }
@@ -535,34 +601,92 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Load embedding context (lazy). Context can be disposed and recreated without reloading the model.
-   * Uses promise guard to prevent concurrent context creation race condition.
+   * Compute how many parallel contexts to create.
+   *
+   * GPU: constrained by VRAM (25% of free, capped at 8).
+   * CPU: constrained by cores. Splitting threads across contexts enables
+   *      true parallelism (each context runs on its own cores). Use at most
+   *      half the math cores, with at least 4 threads per context.
    */
-  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
-    if (!this.embedContext) {
-      // If context creation is already in progress, wait for it
-      if (this.embedContextCreatePromise) {
-        return await this.embedContextCreatePromise;
-      }
+  private async computeParallelism(perContextMB: number): Promise<number> {
+    const llama = await this.ensureLlama();
 
-      // Start context creation and store promise so concurrent calls wait
-      this.embedContextCreatePromise = (async () => {
-        const model = await this.ensureEmbedModel();
-        const context = await model.createEmbeddingContext();
-        this.embedContext = context;
-        return context;
-      })();
-
+    if (llama.gpu) {
       try {
-        const context = await this.embedContextCreatePromise;
-        this.touchActivity();
-        return context;
-      } finally {
-        this.embedContextCreatePromise = null;
+        const vram = await llama.getVramState();
+        const freeMB = vram.free / (1024 * 1024);
+        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
+        return Math.max(1, Math.min(8, maxByVram));
+      } catch {
+        return 2;
       }
     }
-    this.touchActivity();
-    return this.embedContext;
+
+    // CPU: split cores across contexts. At least 4 threads per context.
+    const cores = llama.cpuMathCores || 4;
+    const maxContexts = Math.floor(cores / 4);
+    return Math.max(1, Math.min(4, maxContexts));
+  }
+
+  /**
+   * Get the number of threads each context should use, given N parallel contexts.
+   * Splits available math cores evenly across contexts.
+   */
+  private async threadsPerContext(parallelism: number): Promise<number> {
+    const llama = await this.ensureLlama();
+    if (llama.gpu) return 0; // GPU: let the library decide
+    const cores = llama.cpuMathCores || 4;
+    return Math.max(1, Math.floor(cores / parallelism));
+  }
+
+  /**
+   * Load embedding contexts (lazy). Creates multiple for parallel embedding.
+   * Uses promise guard to prevent concurrent context creation race condition.
+   */
+  private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
+
+  private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
+    if (this.embedContexts.length > 0) {
+      this.touchActivity();
+      return this.embedContexts;
+    }
+
+    if (this.embedContextsCreatePromise) {
+      return await this.embedContextsCreatePromise;
+    }
+
+    this.embedContextsCreatePromise = (async () => {
+      const model = await this.ensureEmbedModel();
+      // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
+      const n = await this.computeParallelism(150);
+      const threads = await this.threadsPerContext(n);
+      for (let i = 0; i < n; i++) {
+        try {
+          this.embedContexts.push(await model.createEmbeddingContext({
+            ...(threads > 0 ? { threads } : {}),
+          }));
+        } catch {
+          if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
+          break;
+        }
+      }
+      this.touchActivity();
+      return this.embedContexts;
+    })();
+
+    try {
+      return await this.embedContextsCreatePromise;
+    } finally {
+      this.embedContextsCreatePromise = null;
+    }
+  }
+
+  /**
+   * Get a single embed context (for single-embed calls). Uses first from pool.
+   */
+  private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
+    const contexts = await this.ensureEmbedContexts();
+    return contexts[0]!;
   }
 
   /**
@@ -624,15 +748,49 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Load rerank context (lazy). Context can be disposed and recreated without reloading the model.
+   * Load rerank contexts (lazy). Creates multiple contexts for parallel ranking.
+   * Each context has its own sequence, so they can evaluate independently.
+   *
+   * Tuning choices:
+   * - contextSize 1024: reranking chunks are ~800 tokens max, 1024 is plenty
+   * - flashAttention: ~20% less VRAM per context (568 vs 711 MB)
+   * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
    */
-  private async ensureRerankContext(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>> {
-    if (!this.rerankContext) {
+  // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
+  // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
+  // Use 2048 for safety margin. Still 17× less than auto (40960).
+  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
+    if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      this.rerankContext = await model.createRankingContext();
+      // ~960 MB per context with flash attention at contextSize 2048
+      const n = Math.min(await this.computeParallelism(1000), 4);
+      const threads = await this.threadsPerContext(n);
+      for (let i = 0; i < n; i++) {
+        try {
+          this.rerankContexts.push(await model.createRankingContext({
+            contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+            flashAttention: true,
+            ...(threads > 0 ? { threads } : {}),
+          } as any));
+        } catch {
+          if (this.rerankContexts.length === 0) {
+            // Flash attention might not be supported — retry without it
+            try {
+              this.rerankContexts.push(await model.createRankingContext({
+                contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+                ...(threads > 0 ? { threads } : {}),
+              }));
+            } catch {
+              throw new Error("Failed to create any rerank context");
+            }
+          }
+          break;
+        }
+      }
     }
     this.touchActivity();
-    return this.rerankContext;
+    return this.rerankContexts;
   }
 
   // ==========================================================================
@@ -674,13 +832,42 @@ export class LlamaCpp implements LLM {
   // Core API methods
   // ==========================================================================
 
+  /**
+   * Truncate text to fit within the embedding model's context window.
+   * Uses the model's own tokenizer for accurate token counting, then
+   * detokenizes back to text if truncation is needed.
+   * Returns the (possibly truncated) text and whether truncation occurred.
+   */
+  private async truncateToContextSize(text: string): Promise<{ text: string; truncated: boolean }> {
+    if (!this.embedModel) return { text, truncated: false };
+
+    const maxTokens = this.embedModel.trainContextSize;
+    if (maxTokens <= 0) return { text, truncated: false };
+
+    const tokens = this.embedModel.tokenize(text);
+    if (tokens.length <= maxTokens) return { text, truncated: false };
+
+    // Leave a small margin (4 tokens) for BOS/EOS overhead
+    const safeLimit = Math.max(1, maxTokens - 4);
+    const truncatedTokens = tokens.slice(0, safeLimit);
+    const truncatedText = this.embedModel.detokenize(truncatedTokens);
+    return { text: truncatedText, truncated: true };
+  }
+
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
     try {
       const context = await this.ensureEmbedContext();
-      const embedding = await context.getEmbeddingFor(text);
+
+      // Guard: truncate text that exceeds model context window to prevent GGML crash
+      const { text: safeText, truncated } = await this.truncateToContextSize(text);
+      if (truncated) {
+        console.warn(`⚠ Text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+      }
+
+      const embedding = await context.getEmbeddingFor(safeText);
 
       return {
         embedding: Array.from(embedding.vector),
@@ -697,32 +884,66 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
     if (texts.length === 0) return [];
 
     try {
-      const context = await this.ensureEmbedContext();
+      const contexts = await this.ensureEmbedContexts();
+      const n = contexts.length;
 
-      // node-llama-cpp handles batching internally when we make parallel requests
-      const embeddings = await Promise.all(
-        texts.map(async (text) => {
+      if (n === 1) {
+        // Single context: sequential (no point splitting)
+        const context = contexts[0]!;
+        const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
+        for (const text of texts) {
           try {
-            const embedding = await context.getEmbeddingFor(text);
-            this.touchActivity();  // Keep-alive during slow batches
-            return {
-              embedding: Array.from(embedding.vector),
-              model: this.embedModelUri,
-            };
+            const { text: safeText, truncated } = await this.truncateToContextSize(text);
+            if (truncated) {
+              console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+            }
+            const embedding = await context.getEmbeddingFor(safeText);
+            this.touchActivity();
+            embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
-            return null;
+            embeddings.push(null);
           }
+        }
+        return embeddings;
+      }
+
+      // Multiple contexts: split texts across contexts for parallel evaluation
+      const chunkSize = Math.ceil(texts.length / n);
+      const chunks = Array.from({ length: n }, (_, i) =>
+        texts.slice(i * chunkSize, (i + 1) * chunkSize)
+      );
+
+      const chunkResults = await Promise.all(
+        chunks.map(async (chunk, i) => {
+          const ctx = contexts[i]!;
+          const results: (EmbeddingResult | null)[] = [];
+          for (const text of chunk) {
+            try {
+              const { text: safeText, truncated } = await this.truncateToContextSize(text);
+              if (truncated) {
+                console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+              }
+              const embedding = await ctx.getEmbeddingFor(safeText);
+              this.touchActivity();
+              results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+            } catch (err) {
+              console.error("Embedding error for text:", err);
+              results.push(null);
+            }
+          }
+          return results;
         })
       );
 
-      return embeddings;
+      return chunkResults.flat();
     } catch (error) {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
@@ -730,6 +951,7 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -788,7 +1010,8 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -807,10 +1030,15 @@ export class LlamaCpp implements LLM {
       `
     });
 
-    const prompt = `/no_think Expand this search query: ${query}`;
+    const intent = options.intent;
+    const prompt = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
 
-    // Create fresh context for each call
-    const genContext = await this.generateModel!.createContext();
+    // Create a bounded context for expansion to prevent large default VRAM allocations.
+    const genContext = await this.generateModel!.createContext({
+      contextSize: this.expandContextSize,
+    });
     const sequence = genContext.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
@@ -871,41 +1099,131 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  // Qwen3 reranker chat template overhead (system prompt, tags, separators)
+  private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
+  private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
+
   async rerank(
     query: string,
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
-    const context = await this.ensureRerankContext();
+    const contexts = await this.ensureRerankContexts();
+    const model = await this.ensureRerankModel();
 
-    // Build a map from document text to original indices (for lookup after sorting)
-    const textToDoc = new Map<string, { file: string; index: number }>();
-    documents.forEach((doc, index) => {
-      textToDoc.set(doc.text, { file: doc.file, index });
+    // Truncate documents that would exceed the rerank context size.
+    // Budget = contextSize - template overhead - query tokens
+    const queryTokens = model.tokenize(query).length;
+    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+    const truncationCache = new Map<string, string>();
+
+    const truncatedDocs = documents.map((doc) => {
+      const cached = truncationCache.get(doc.text);
+      if (cached !== undefined) {
+        return cached === doc.text ? doc : { ...doc, text: cached };
+      }
+
+      const tokens = model.tokenize(doc.text);
+      const truncatedText = tokens.length <= maxDocTokens
+        ? doc.text
+        : model.detokenize(tokens.slice(0, maxDocTokens));
+      truncationCache.set(doc.text, truncatedText);
+
+      if (truncatedText === doc.text) return doc;
+      return { ...doc, text: truncatedText };
+    });
+
+    // Deduplicate identical effective texts before scoring.
+    // This avoids redundant work for repeated chunks and fixes collisions where
+    // multiple docs map to the same chunk text.
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
+    truncatedDocs.forEach((doc, index) => {
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index }]);
+      }
     });
 
     // Extract just the text for ranking
-    const texts = documents.map((doc) => doc.text);
+    const texts = Array.from(textToDocs.keys());
 
-    // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
-    const ranked = await context.rankAndSort(query, texts);
+    // Split documents across contexts for parallel evaluation.
+    // Each context has its own sequence with a lock, so parallelism comes
+    // from multiple contexts evaluating different chunks simultaneously.
+    const activeContextCount = Math.max(
+      1,
+      Math.min(
+        contexts.length,
+        Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
+      )
+    );
+    const activeContexts = contexts.slice(0, activeContextCount);
+    const chunkSize = Math.ceil(texts.length / activeContexts.length);
+    const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
+      texts.slice(i * chunkSize, (i + 1) * chunkSize)
+    ).filter(chunk => chunk.length > 0);
 
-    // Map back to our result format using the text-to-doc map
-    const results: RerankDocumentResult[] = ranked.map((item) => {
-      const docInfo = textToDoc.get(item.document)!;
-      return {
-        file: docInfo.file,
-        score: item.score,
-        index: docInfo.index,
-      };
-    });
+    const allScores = await Promise.all(
+      chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
+    );
+
+    // Reassemble scores in original order and sort
+    const flatScores = allScores.flat();
+    const ranked = texts
+      .map((text, i) => ({ document: text, score: flatScores[i]! }))
+      .sort((a, b) => b.score - a.score);
+
+    // Map back to our result format.
+    const results: RerankDocumentResult[] = [];
+    for (const item of ranked) {
+      const docInfos = textToDocs.get(item.document) ?? [];
+      for (const docInfo of docInfos) {
+        results.push({
+          file: docInfo.file,
+          score: item.score,
+          index: docInfo.index,
+        });
+      }
+    }
 
     return {
       results,
       model: this.rerankModelUri,
+    };
+  }
+
+  /**
+   * Get device/GPU info for status display.
+   * Initializes llama if not already done.
+   */
+  async getDeviceInfo(): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }> {
+    const llama = await this.ensureLlama();
+    const gpuDevices = await llama.getGpuDeviceNames();
+    let vram: { total: number; used: number; free: number } | undefined;
+    if (llama.gpu) {
+      try {
+        const state = await llama.getVramState();
+        vram = { total: state.total, used: state.used, free: state.free };
+      } catch { /* no vram info */ }
+    }
+    return {
+      gpu: llama.gpu,
+      gpuOffloading: llama.supportsGpuOffloading,
+      gpuDevices,
+      vram,
+      cpuCores: llama.cpuMathCores,
     };
   }
 
@@ -932,8 +1250,8 @@ export class LlamaCpp implements LLM {
     }
 
     // Clear references
-    this.embedContext = null;
-    this.rerankContext = null;
+    this.embedContexts = [];
+    this.rerankContexts = [];
     this.embedModel = null;
     this.generateModel = null;
     this.rerankModel = null;
@@ -941,7 +1259,7 @@ export class LlamaCpp implements LLM {
 
     // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;
-    this.embedContextCreatePromise = null;
+    this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
   }
@@ -1165,6 +1483,25 @@ export async function withLLMSession<T>(
 }
 
 /**
+ * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
+ * Unlike withLLMSession, this does not use the global singleton.
+ */
+export async function withLLMSessionForLlm<T>(
+  llm: LlamaCpp,
+  fn: (session: ILLMSession) => Promise<T>,
+  options?: LLMSessionOptions
+): Promise<T> {
+  const manager = new LLMSessionManager(llm);
+  const session = new LLMSession(manager, options);
+
+  try {
+    return await fn(session);
+  } finally {
+    session.release();
+  }
+}
+
+/**
  * Check if idle unload is safe (no active sessions or operations).
  * Used internally by LlamaCpp idle timer.
  */
@@ -1184,7 +1521,8 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    const embedModel = process.env.QMD_EMBED_MODEL;
+    defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
   }
   return defaultLlamaCpp;
 }

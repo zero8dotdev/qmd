@@ -1,151 +1,144 @@
 ---
 name: qmd
-description: Search personal markdown knowledge bases, notes, meeting transcripts, and documentation using QMD - a local hybrid search engine. Combines BM25 keyword search, vector semantic search, and LLM re-ranking. Use when users ask to search notes, find documents, look up information in their knowledge base, retrieve meeting notes, or search documentation. Triggers on "search markdown files", "search my notes", "find in docs", "look up", "what did I write about", "meeting notes about".
+description: Search markdown knowledge bases, notes, and documentation using QMD. Use when users ask to search notes, find documents, or look up information.
 license: MIT
-compatibility: Requires qmd CLI or MCP server. Install via `bun install -g https://github.com/tobi/qmd`.
+compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @tobilu/qmd`.
 metadata:
   author: tobi
-  version: "1.1.1"
+  version: "2.0.0"
 allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
 # QMD - Quick Markdown Search
 
-QMD is a local, on-device search engine for markdown content. It indexes your notes, meeting transcripts, documentation, and knowledge bases for fast retrieval.
+Local search engine for markdown content.
 
-## QMD Status
+## Status
 
-!`qmd status 2>/dev/null || echo "Not installed. Run: bun install -g https://github.com/tobi/qmd"`
+!`qmd status 2>/dev/null || echo "Not installed: npm install -g @tobilu/qmd"`
 
-## When to Use This Skill
+## MCP: `query`
 
-- User asks to search their notes, documents, or knowledge base
-- User needs to find information in their markdown files
-- User wants to retrieve specific documents or search across collections
-- User asks "what did I write about X" or "find my notes on Y"
-- User needs semantic search (conceptual similarity) not just keyword matching
-- User mentions meeting notes, transcripts, or documentation lookup
-
-## Search Commands
-
-Choose the right search mode for the task:
-
-| Command | Use When | Speed |
-|---------|----------|-------|
-| `qmd search` | Exact keyword matches needed | Fast |
-| `qmd vsearch` | Keywords aren't working, need conceptual matches | Medium |
-| `qmd query` | Best results needed, speed not critical | Slower |
-
-```bash
-# Fast keyword search (BM25)
-qmd search "your query"
-
-# Semantic vector search (finds conceptually similar content)
-qmd vsearch "your query"
-
-# Hybrid search with re-ranking (best quality)
-qmd query "your query"
+```json
+{
+  "searches": [
+    { "type": "lex", "query": "CAP theorem consistency" },
+    { "type": "vec", "query": "tradeoff between consistency and availability" }
+  ],
+  "collections": ["docs"],
+  "limit": 10
+}
 ```
 
-## Common Options
+### Query Types
 
-```bash
--n <num>                 # Number of results (default: 5)
--c, --collection <name>  # Restrict to specific collection
---all                    # Return all matches
---min-score <num>        # Minimum score threshold (0.0-1.0)
---full                   # Show full document content
---json                   # JSON output for processing
---files                  # List files with scores
---line-numbers           # Add line numbers to output
+| Type | Method | Input |
+|------|--------|-------|
+| `lex` | BM25 | Keywords — exact terms, names, code |
+| `vec` | Vector | Question — natural language |
+| `hyde` | Vector | Answer — hypothetical result (50-100 words) |
+
+### Writing Good Queries
+
+**lex (keyword)**
+- 2-5 terms, no filler words
+- Exact phrase: `"connection pool"` (quoted)
+- Exclude terms: `performance -sports` (minus prefix)
+- Code identifiers work: `handleError async`
+
+**vec (semantic)**
+- Full natural language question
+- Be specific: `"how does the rate limiter handle burst traffic"`
+- Include context: `"in the payment service, how are refunds processed"`
+
+**hyde (hypothetical document)**
+- Write 50-100 words of what the *answer* looks like
+- Use the vocabulary you expect in the result
+
+**expand (auto-expand)**
+- Use a single-line query (implicit) or `expand: question` on its own line
+- Lets the local LLM generate lex/vec/hyde variations
+- Do not mix `expand:` with other typed lines — it's either a standalone expand query or a full query document
+
+### Intent (Disambiguation)
+
+When a query term is ambiguous, add `intent` to steer results:
+
+```json
+{
+  "searches": [
+    { "type": "lex", "query": "performance" }
+  ],
+  "intent": "web page load times and Core Web Vitals"
+}
 ```
 
-## Document Retrieval
+Intent affects expansion, reranking, chunk selection, and snippet extraction. It does not search on its own — it's a steering signal that disambiguates queries like "performance" (web-perf vs team health vs fitness).
 
-```bash
-# Get document by path
-qmd get "collection/path/to/doc.md"
+### Combining Types
 
-# Get document by docid (shown in search results as #abc123)
-qmd get "#abc123"
+| Goal | Approach |
+|------|----------|
+| Know exact terms | `lex` only |
+| Don't know vocabulary | Use a single-line query (implicit `expand:`) or `vec` |
+| Best recall | `lex` + `vec` |
+| Complex topic | `lex` + `vec` + `hyde` |
+| Ambiguous query | Add `intent` to any combination above |
 
-# Get with line numbers for code review
-qmd get "docs/api.md" --line-numbers
+First query gets 2x weight in fusion — put your best guess first.
 
-# Get multiple documents by glob pattern
-qmd multi-get "docs/*.md"
+### Lex Query Syntax
 
-# Get multiple documents by list
-qmd multi-get "doc1.md, doc2.md, #abc123"
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `term` | Prefix match | `perf` matches "performance" |
+| `"phrase"` | Exact phrase | `"rate limiter"` |
+| `-term` | Exclude | `performance -sports` |
+
+Note: `-term` only works in lex queries, not vec/hyde.
+
+### Collection Filtering
+
+```json
+{ "collections": ["docs"] }              // Single
+{ "collections": ["docs", "notes"] }     // Multiple (OR)
 ```
 
-## Index Management
+Omit to search all collections.
+
+## Other MCP Tools
+
+| Tool | Use |
+|------|-----|
+| `get` | Retrieve doc by path or `#docid` |
+| `multi_get` | Retrieve multiple by glob/list |
+| `status` | Collections and health |
+
+## CLI
 
 ```bash
-# Check index status and available collections
-qmd status
-
-# List all collections
-qmd collection list
-
-# List files in a collection
-qmd ls <collection-name>
-
-# Update index (re-scan files for changes)
-qmd update
+qmd query "question"              # Auto-expand + rerank
+qmd query $'lex: X\nvec: Y'       # Structured
+qmd query $'expand: question'     # Explicit expand
+qmd query --json --explain "q"    # Show score traces (RRF + rerank blend)
+qmd search "keywords"             # BM25 only (no LLM)
+qmd get "#abc123"                 # By docid
+qmd multi-get "journals/2026-*.md" -l 40  # Batch pull snippets by glob
+qmd multi-get notes/foo.md,notes/bar.md   # Comma-separated list, preserves order
 ```
 
-## Score Interpretation
-
-| Score | Meaning | Action |
-|-------|---------|--------|
-| 0.8 - 1.0 | Highly relevant | Show to user |
-| 0.5 - 0.8 | Moderately relevant | Include if few results |
-| 0.2 - 0.5 | Somewhat relevant | Only if user wants more |
-| 0.0 - 0.2 | Low relevance | Usually skip |
-
-## Recommended Workflow
-
-1. **Check what's available**: `qmd status`
-2. **Start with keyword search**: `qmd search "topic" -n 10`
-3. **Try semantic if needed**: `qmd vsearch "describe the concept"`
-4. **Use hybrid for best results**: `qmd query "question" --min-score 0.4`
-5. **Retrieve full documents**: `qmd get "#docid" --full`
-
-## Example: Finding Meeting Notes
+## HTTP API
 
 ```bash
-# Search for meetings about a topic
-qmd search "quarterly review" -c meetings -n 5
-
-# Get semantic matches
-qmd vsearch "performance discussion" -c meetings
-
-# Retrieve the full meeting notes
-qmd get "#abc123" --full
+curl -X POST http://localhost:8181/query \
+  -H "Content-Type: application/json" \
+  -d '{"searches": [{"type": "lex", "query": "test"}]}'
 ```
 
-## Example: Research Across All Notes
+## Setup
 
 ```bash
-# Hybrid search for best results
-qmd query "authentication implementation" --min-score 0.3 --json
-
-# Get all relevant files for deeper analysis
-qmd query "auth flow" --all --files --min-score 0.4
+npm install -g @tobilu/qmd
+qmd collection add ~/notes --name notes
+qmd embed
 ```
-
-## MCP Server Integration
-
-This plugin configures the qmd MCP server automatically. When available, prefer MCP tools over Bash for tighter integration:
-
-| MCP Tool | Equivalent CLI | Purpose |
-|----------|---------------|---------|
-| `qmd_search` | `qmd search` | Fast BM25 keyword search |
-| `qmd_vsearch` | `qmd vsearch` | Semantic vector search |
-| `qmd_query` | `qmd query` | Hybrid search with reranking |
-| `qmd_get` | `qmd get` | Retrieve document by path or docid |
-| `qmd_multi_get` | `qmd multi-get` | Retrieve multiple documents |
-| `qmd_status` | `qmd status` | Index health and collection info |
-
-For manual MCP setup without the plugin, see [references/mcp-setup.md](references/mcp-setup.md).
