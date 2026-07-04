@@ -46,9 +46,14 @@ export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 export const DEFAULT_GLOB = "**/*.md";
-export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
+export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
+export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
+
+const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
+const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
+const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -60,6 +65,17 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 // Search window for finding optimal break points (in tokens, ~200 tokens)
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
+
+export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
+  const significant = [
+    `model:${model}`,
+    `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
+    `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
+    `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
+    `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+  ].join("\n");
+  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+}
 
 /**
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
@@ -740,6 +756,10 @@ const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\
 const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
 
+// Bump when any FTS sync trigger body in applyFtsSyncTriggers changes, so the
+// new definition is reapplied to existing databases on next open.
+const STORE_SCHEMA_VERSION = 1;
+
 /**
  * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
  * Normalize CJK runs by spacing every character so exact CJK queries can be
@@ -761,46 +781,177 @@ function sanitizeFTS5Phrase(phrase: string): string {
     .join(' ');
 }
 
-function rebuildFTSForCjkNormalization(db: Database): void {
+function getUserVersion(db: Database): number {
+  const row = db.prepare(`PRAGMA user_version`).get() as Record<string, number> | undefined;
+  const value = row ? Object.values(row)[0] : 0;
+  return typeof value === "number" ? value : Number(value) || 0;
+}
+
+// FTS sync triggers keep documents_fts current for callers that write directly
+// to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
+// first). The bodies use DROP+CREATE rather than CREATE IF NOT EXISTS so a
+// changed body propagates to existing databases. DROP and CREATE are separate
+// autocommit statements, so concurrent opens of one database interleave across
+// connections (A drops, B drops, A creates, B creates -> "trigger already
+// exists"); busy_timeout serializes individual statements but not the pair.
+// Gate the work behind PRAGMA user_version and apply it inside one IMMEDIATE
+// transaction: the DROP+CREATE pair is atomic across connections, and a
+// double-checked read skips it once any process has stamped the version.
+function applyFtsSyncTriggers(db: Database): void {
+  if (getUserVersion(db) >= STORE_SCHEMA_VERSION) return;
+  db.exec(`BEGIN IMMEDIATE`);
+  try {
+    if (getUserVersion(db) < STORE_SCHEMA_VERSION) {
+      db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+      db.exec(`
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents
+        WHEN new.active = 1
+        BEGIN
+          INSERT INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END
+      `);
+
+      db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+      db.exec(`
+        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+        END
+      `);
+
+      db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+      db.exec(`
+        CREATE TRIGGER documents_au AFTER UPDATE ON documents
+        BEGIN
+          -- Delete from FTS if no longer active
+          DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+          -- Update FTS if still/newly active
+          INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END
+      `);
+
+      db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+    }
+    db.exec(`COMMIT`);
+  } catch (err) {
+    db.exec(`ROLLBACK`);
+    throw err;
+  }
+}
+
+function cjkRebuildVersion(db: Database): string | undefined {
   const version = db.prepare(`SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`).get() as { value?: string } | undefined;
-  if (version?.value === FTS_CJK_NORMALIZED_VERSION) return;
+  return version?.value;
+}
+
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+function dropTableIfExists(db: Database, tableName: string): void {
+  db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`);
+}
+
+function rebuildFTSForCjkNormalization(db: Database): void {
+  if (cjkRebuildVersion(db) === FTS_CJK_NORMALIZED_VERSION) return;
+
+  // Clean up the legacy fixed-name shadow table left by an interrupted older
+  // rebuild implementation. New concurrent rebuilds use per-process names below.
+  dropTableIfExists(db, "documents_fts_rebuild");
+
+  // Stream rows from disk and build into a per-process shadow FTS table. A fixed
+  // shadow name made concurrent cold opens collide (`database is locked`, then
+  // `no such table: documents_fts_rebuild`) before the schema version could be
+  // stamped. The final live-table swap is protected by BEGIN IMMEDIATE and a
+  // double-checked version read, so only one process publishes the rebuild.
+  const BATCH_SIZE = 500;
+  const rebuildTable = `documents_fts_rebuild_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const quotedRebuildTable = quoteSqlIdentifier(rebuildTable);
 
   try {
-    db.exec(`DELETE FROM documents_fts WHERE rowid >= 0`);
-  } catch {
-    // Some older/corrupt FTS5 shadow-table states can reject bulk deletes even
-    // though reads still work. Recreate the virtual table; documents_fts is a
-    // derived index, so rebuilding it from documents/content is safe.
-    db.exec(`DROP TABLE IF EXISTS documents_fts`);
     db.exec(`
-      CREATE VIRTUAL TABLE documents_fts USING fts5(
+      CREATE VIRTUAL TABLE ${quotedRebuildTable} USING fts5(
         filepath, title, body,
         tokenize='porter unicode61'
       )
     `);
-  }
-  const rows = db.prepare(`
-    SELECT d.id, d.collection, d.path, d.title, content.doc as body
-    FROM documents d
-    JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
-  `).all() as { id: number; collection: string; path: string; title: string; body: string }[];
-  const insert = db.prepare(`INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
-  const rebuild = db.transaction(() => {
-    for (const row of rows) {
-      insert.run(
-        row.id,
-        normalizeCjkForFTS(`${row.collection}/${row.path}`),
-        normalizeCjkForFTS(row.title),
-        normalizeCjkForFTS(row.body)
-      );
+
+    type FtsRow = { id: number; collection: string; path: string; title: string; body: string };
+
+    const insert = db.prepare(`INSERT INTO ${quotedRebuildTable}(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
+
+    // The transaction closes over a mutable `batch` buffer rather than taking the
+    // batch as an argument: the wrapper's transaction() type only accepts scalar
+    // SQLiteValue args, and we want each commit to wrap a bounded set of inserts.
+    let batch: FtsRow[] = [];
+    const flushBatch = db.transaction(() => {
+      for (const row of batch) {
+        insert.run(
+          row.id,
+          normalizeCjkForFTS(`${row.collection}/${row.path}`),
+          normalizeCjkForFTS(row.title),
+          normalizeCjkForFTS(row.body)
+        );
+      }
+    });
+
+    // .iterate() pulls rows one at a time from SQLite rather than materializing
+    // the entire result set (every document body) into a JS array up front.
+    const iterator = db.prepare(`
+      SELECT d.id, d.collection, d.path, d.title, content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.active = 1
+    `).iterate<FtsRow>();
+
+    for (const row of iterator) {
+      batch.push(row);
+      if (batch.length >= BATCH_SIZE) {
+        flushBatch();
+        batch = [];
+      }
     }
-  });
-  rebuild();
-  db.prepare(`
-    INSERT OR REPLACE INTO store_config(key, value)
-    VALUES ('fts_cjk_normalized_version', ?)
-  `).run(FTS_CJK_NORMALIZED_VERSION);
+    if (batch.length > 0) {
+      flushBatch();
+    }
+
+    // Atomic publish: copy the completed shadow index into the live table and
+    // stamp the version while holding the writer lock. If another process won
+    // the race while this one was building its shadow, skip the publish and only
+    // drop this process's private shadow table.
+    db.exec(`BEGIN IMMEDIATE`);
+    try {
+      if (cjkRebuildVersion(db) !== FTS_CJK_NORMALIZED_VERSION) {
+        db.exec(`DELETE FROM documents_fts`);
+        db.exec(
+          `INSERT INTO documents_fts(rowid, filepath, title, body)
+           SELECT rowid, filepath, title, body FROM ${quotedRebuildTable}`
+        );
+        db.prepare(`
+          INSERT OR REPLACE INTO store_config(key, value)
+          VALUES ('fts_cjk_normalized_version', ?)
+        `).run(FTS_CJK_NORMALIZED_VERSION);
+      }
+      db.exec(`COMMIT`);
+    } catch (err) {
+      db.exec(`ROLLBACK`);
+      throw err;
+    }
+  } finally {
+    dropTableIfExists(db, rebuildTable);
+  }
 }
 
 function initializeDatabase(db: Database): void {
@@ -815,7 +966,6 @@ function initializeDatabase(db: Database): void {
     _sqliteVecUnavailableReason = getErrorMessage(err);
     console.warn(_sqliteVecUnavailableReason);
   }
-  db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
@@ -861,28 +1011,20 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Content vectors
-  const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
-  const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
-  if (cvInfo.length > 0 && !hasSeqColumn) {
-    db.exec(`DROP TABLE IF EXISTS content_vectors`);
-    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
-  }
+  // Content vectors. Avoid PRAGMA schema probes during startup; legacy vector
+  // columns are repaired lazily when a vector/embedding query first needs them.
   db.exec(`
     CREATE TABLE IF NOT EXISTS content_vectors (
       hash TEXT NOT NULL,
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
+      embed_fingerprint TEXT NOT NULL DEFAULT '',
       total_chunks INTEGER NOT NULL DEFAULT 1,
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
     )
   `);
-  const cvInfoAfterCreate = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
-  if (!cvInfoAfterCreate.some(col => col.name === 'total_chunks')) {
-    db.exec(`ALTER TABLE content_vectors ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 1`);
-  }
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -913,48 +1055,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Triggers keep FTS in sync for callers that write directly to documents.
-  // Production indexing paths rebuild entries in TypeScript so CJK text can be
-  // normalized before it reaches the unicode61 tokenizer.
-  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
-  db.exec(`
-    CREATE TRIGGER documents_ai AFTER INSERT ON documents
-    WHEN new.active = 1
-    BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
-
-  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
-  db.exec(`
-    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-      DELETE FROM documents_fts WHERE rowid = old.id;
-    END
-  `);
-
-  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
-  db.exec(`
-    CREATE TRIGGER documents_au AFTER UPDATE ON documents
-    BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-      -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
+  applyFtsSyncTriggers(db);
 
   rebuildFTSForCjkNormalization(db);
 }
@@ -1215,7 +1316,7 @@ export type Store = {
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
-  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
+  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
   getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
   findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => { docs: MultiGetResult[]; errors: string[] };
 
@@ -1237,7 +1338,7 @@ export type Store = {
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
 };
 
 // =============================================================================
@@ -1299,7 +1400,10 @@ export async function reindexCollection(
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    const path = handelize(relativeFile);
+    // Store the literal relative path so the filesystem path can always be
+    // reconstructed as: resolve(collection.path, storedPath).
+    // handelize() is NOT applied at index time — it is display-only.
+    const path = normalizePathSeparators(relativeFile);
     seenPaths.add(path);
 
     let content: string;
@@ -1364,18 +1468,30 @@ export async function reindexCollection(
   return { indexed, updated, unchanged, removed, orphanedCleaned };
 }
 
+export type EmbedFailure = {
+  path: string;
+  hash: string;
+  seq: number;
+  attempts: number;
+  reason: string;
+};
+
 export type EmbedProgress = {
   chunksEmbedded: number;
   totalChunks: number;
   bytesProcessed: number;
   totalBytes: number;
+  /** Active failed chunks still awaiting a successful retry. */
   errors: number;
+  failures?: EmbedFailure[];
 };
 
 export type EmbedResult = {
   docsProcessed: number;
   chunksEmbedded: number;
+  /** Active failed chunks that did not recover after retries. */
   errors: number;
+  failures?: EmbedFailure[];
   durationMs: number;
 };
 
@@ -1390,6 +1506,13 @@ export type EmbedOptions = {
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
+  /**
+   * Max wall-clock duration for the whole embed session, in milliseconds. When the
+   * cap is reached, remaining document batches are skipped (re-run `qmd embed` to
+   * continue). A value <= 0 disables the cap. Defaults to
+   * {@link DEFAULT_EMBED_MAX_DURATION_MS} (30 minutes).
+   */
+  maxDurationMs?: number;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -1405,12 +1528,14 @@ type EmbeddingDoc = PendingEmbeddingDoc & {
 
 type ChunkItem = {
   hash: string;
+  path: string;
   title: string;
   text: string;
   seq: number;
   pos: number;
   tokens: number;
   bytes: number;
+  expectedTotalChunks: number;
 };
 
 function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
@@ -1428,31 +1553,76 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
   };
 }
 
-function contentVectorExpectedChunksExpr(db: Database): string {
-  const columns = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
-  return columns.some(col => col.name === 'total_chunks') ? 'MAX(total_chunks)' : '1';
+const CONTENT_VECTOR_DESIRED_COLUMNS: { name: string; definition: string }[] = [
+  { name: "seq", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { name: "pos", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { name: "model", definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: "embed_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: "total_chunks", definition: "INTEGER NOT NULL DEFAULT 1" },
+  { name: "embedded_at", definition: "TEXT NOT NULL DEFAULT ''" },
+];
+
+function isContentVectorColumnError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/(no such column|has no column named)/i.test(message)) {
+    return false;
+  }
+  return CONTENT_VECTOR_DESIRED_COLUMNS.some(col => message.includes(col.name));
+}
+
+function runContentVectorColumnRepairs(db: Database): void {
+  for (const column of CONTENT_VECTOR_DESIRED_COLUMNS) {
+    try {
+      db.exec(`ALTER TABLE content_vectors ADD COLUMN ${column.name} ${column.definition}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // The repair series is intentionally idempotent: most columns should
+      // already exist, and another caller may have repaired a missing column
+      // between the failed query and this ALTER series.
+      if (!message.includes("duplicate column name")) {
+        throw error;
+      }
+    }
+  }
+}
+
+function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T {
+  let repaired = false;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      if (repaired || !isContentVectorColumnError(error)) {
+        throw error;
+      }
+      runContentVectorColumnRepairs(db);
+      repaired = true;
+    }
+  }
 }
 
 function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const expectedChunksExpr = contentVectorExpectedChunksExpr(db);
-  const stmt = db.prepare(`
-    SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN (
-      SELECT hash, model, COUNT(*) AS chunk_count, ${expectedChunksExpr} AS expected_chunks
-      FROM content_vectors
-      WHERE model = ?
-      GROUP BY hash, model
-    ) v ON d.hash = v.hash
-    WHERE d.active = 1
-      AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-      ${collectionFilter}
-    GROUP BY d.hash
-    ORDER BY MIN(d.path)
-  `);
-  return (collection ? stmt.all(model, collection) : stmt.all(model)) as PendingEmbeddingDoc[];
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+      SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+      FROM documents d
+      JOIN content c ON d.hash = c.hash
+      LEFT JOIN (
+        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        FROM content_vectors
+        WHERE model = ? AND embed_fingerprint = ?
+        GROUP BY hash, model, embed_fingerprint
+      ) v ON d.hash = v.hash
+      WHERE d.active = 1
+        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        ${collectionFilter}
+      GROUP BY d.hash
+      ORDER BY MIN(d.path)
+    `);
+    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+  });
 }
 
 function buildEmbeddingBatches(
@@ -1515,6 +1685,7 @@ export async function generateEmbeddings(
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+  const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
@@ -1538,11 +1709,81 @@ export async function generateEmbeddings(
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
     let chunksEmbedded = 0;
-    let errors = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
     const BATCH_SIZE = 32;
+    const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
+    const MAX_RETRY_ATTEMPTS = 3;
+    const failures = new Map<string, EmbedFailure>();
+    const retryQueue = new Map<string, ChunkItem>();
+    let successesSinceRetry = 0;
+
+    const failureList = () => [...failures.values()];
+    const activeErrorCount = () => failures.size;
+    const chunkKey = (chunk: ChunkItem) => `${chunk.hash}:${chunk.seq}`;
+    const reasonFromError = (error: unknown) => {
+      const raw = error instanceof Error ? error.message : String(error);
+      return raw.length > 180 ? `${raw.slice(0, 177)}...` : raw;
+    };
+    const recordFailure = (chunk: ChunkItem, reason: string) => {
+      const key = chunkKey(chunk);
+      const previous = failures.get(key);
+      failures.set(key, {
+        path: chunk.path,
+        hash: chunk.hash,
+        seq: chunk.seq,
+        attempts: (previous?.attempts ?? 0) + 1,
+        reason,
+      });
+      retryQueue.set(key, chunk);
+    };
+    const clearFailure = (chunk: ChunkItem) => {
+      const key = chunkKey(chunk);
+      failures.delete(key);
+      retryQueue.delete(key);
+    };
+    const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
+      try {
+        const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
+        const result = await session.embed(text, { model });
+        if (!result) {
+          recordFailure(chunk, "embedding returned no vector");
+          return false;
+        }
+        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+        chunksEmbedded++;
+        successesSinceRetry++;
+        clearFailure(chunk);
+        return true;
+      } catch (error) {
+        recordFailure(chunk, reasonFromError(error));
+        return false;
+      }
+    };
+    const retryFailedChunks = async (force = false) => {
+      if (!session.isValid || retryQueue.size === 0) return;
+      if (!force && successesSinceRetry < RETRY_AFTER_SUCCESSFUL_CHUNKS) return;
+      successesSinceRetry = 0;
+
+      // Normal mode: one retry pass after enough unrelated chunks succeeded.
+      // Force mode: we have run out of other chunks for this batch, so keep
+      // retrying outstanding failures until they recover or hit the cap. The
+      // cap prevents endless loops on permanently bad chunks.
+      do {
+        let retried = 0;
+        for (const [key, chunk] of [...retryQueue]) {
+          const failure = failures.get(key);
+          if (!failure || failure.attempts >= MAX_RETRY_ATTEMPTS) continue;
+          retried++;
+          await tryEmbedChunk(chunk);
+        }
+        if (!force || retried === 0) break;
+      } while (session.isValid && [...retryQueue].some(([key]) => {
+        const failure = failures.get(key);
+        return !!failure && failure.attempts < MAX_RETRY_ATTEMPTS;
+      }));
+    };
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
@@ -1572,12 +1813,14 @@ export async function generateEmbeddings(
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
             hash: doc.hash,
+            path: doc.path,
             title,
             text: chunks[seq]!.text,
             seq,
             pos: chunks[seq]!.pos,
             tokens: chunks[seq]!.tokens,
             bytes: encoder.encode(chunks[seq]!.text).length,
+            expectedTotalChunks: chunks.length,
           });
         }
         expectedChunksByHash.set(doc.hash, chunks.length);
@@ -1587,7 +1830,7 @@ export async function generateEmbeddings(
 
       if (batchChunks.length === 0) {
         bytesProcessed += batchBytes;
-        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
         continue;
       }
 
@@ -1608,18 +1851,18 @@ export async function generateEmbeddings(
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
         // Abort early if session has been invalidated (e.g. max duration exceeded)
         if (!session.isValid) {
-          const remaining = batchChunks.length - batchStart;
-          errors += remaining;
-          console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
+          const remainingChunks = batchChunks.slice(batchStart);
+          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
+          console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
           break;
         }
 
-        // Abort early if error rate is too high (>80% of processed chunks failed)
-        const processed = chunksEmbedded + errors;
-        if (processed >= BATCH_SIZE && errors > processed * 0.8) {
-          const remaining = batchChunks.length - batchStart;
-          errors += remaining;
-          console.warn(`⚠ Error rate too high (${errors}/${processed}) — aborting embedding`);
+        // Abort early if active error rate is too high (>80% of attempted chunks failed)
+        const processed = chunksEmbedded + activeErrorCount();
+        if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
+          const remainingChunks = batchChunks.slice(batchStart);
+          for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
+          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
           break;
         }
 
@@ -1633,34 +1876,29 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, expectedChunksByHash.get(chunk.hash) ?? 1);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
               chunksEmbedded++;
+              successesSinceRetry++;
+              clearFailure(chunk);
             } else {
-              errors++;
+              recordFailure(chunk, "batch embedding returned no vector");
             }
             batchChunkBytesProcessed += chunk.bytes;
           }
-        } catch {
-          // Batch failed — try individual embeddings as fallback
-          // But skip if session is already invalid (avoids N doomed retries)
+          await retryFailedChunks();
+        } catch (error) {
+          // Batch failed — try individual embeddings as fallback. If an
+          // individual retry succeeds, any prior failure for that chunk is
+          // cleared, so the visible error count reflects outstanding failures.
+          const batchReason = reasonFromError(error);
           if (!session.isValid) {
-            errors += chunkBatch.length;
+            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
             for (const chunk of chunkBatch) {
-              try {
-                const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-                const result = await session.embed(text, { model });
-                if (result) {
-                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, expectedChunksByHash.get(chunk.hash) ?? 1);
-                  chunksEmbedded++;
-                } else {
-                  errors++;
-                }
-              } catch {
-                errors++;
-              }
+              await tryEmbedChunk(chunk);
               batchChunkBytesProcessed += chunk.bytes;
+              await retryFailedChunks();
             }
           }
         }
@@ -1673,9 +1911,12 @@ export async function generateEmbeddings(
           totalChunks,
           bytesProcessed: bytesProcessed + proportionalBytes,
           totalBytes,
-          errors,
+          errors: activeErrorCount(),
+          failures: failureList(),
         });
       }
+
+      await retryFailedChunks(true);
 
       const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
       if (removedPartialChunks > 0) {
@@ -1683,16 +1924,17 @@ export async function generateEmbeddings(
       }
 
       bytesProcessed += batchBytes;
-      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
     }
 
-    return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+    return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
+  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
     chunksEmbedded: result.chunksEmbedded,
     errors: result.errors,
+    failures: result.failures,
     durationMs: Date.now() - startTime,
   };
 }
@@ -1778,7 +2020,7 @@ export function createStore(dbPath?: string): Store {
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint),
   };
 
   return store;
@@ -1946,6 +2188,16 @@ export type DocumentNotFound = {
   similarFiles: string[];
 };
 
+export type DocumentExcludedByIgnore = {
+  error: "excluded_by_ignore";
+  query: string;
+  collection: string;
+  path: string;
+  rule: string;
+};
+
+export type DocumentLookupError = DocumentNotFound | DocumentExcludedByIgnore;
+
 /**
  * Result from multi-get operations
  */
@@ -1979,22 +2231,24 @@ export type IndexStatus = {
 
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const expectedChunksExpr = contentVectorExpectedChunksExpr(db);
-  const stmt = db.prepare(`
-    SELECT COUNT(DISTINCT d.hash) as count
-    FROM documents d
-    LEFT JOIN (
-      SELECT hash, model, COUNT(*) AS chunk_count, ${expectedChunksExpr} AS expected_chunks
-      FROM content_vectors
-      WHERE model = ?
-      GROUP BY hash, model
-    ) v ON d.hash = v.hash
-    WHERE d.active = 1
-      AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-      ${collectionFilter}
-  `);
-  const result = (collection ? stmt.get(model, collection) : stmt.get(model)) as { count: number };
-  return result.count;
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+      SELECT COUNT(DISTINCT d.hash) as count
+      FROM documents d
+      LEFT JOIN (
+        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        FROM content_vectors
+        WHERE model = ? AND embed_fingerprint = ?
+        GROUP BY hash, model, embed_fingerprint
+      ) v ON d.hash = v.hash
+      WHERE d.active = 1
+        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        ${collectionFilter}
+    `);
+    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    return result.count;
+  });
 }
 
 export type IndexHealthInfo = {
@@ -2002,6 +2256,79 @@ export type IndexHealthInfo = {
   totalDocs: number;
   daysStale: number | null;
 };
+
+export type LegacyFingerprintAdoptionResult = {
+  checked: boolean;
+  adopted: number;
+  reason: string;
+};
+
+export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
+  const db = store.db;
+  const fingerprint = getEmbeddingFingerprint(model);
+  const legacyCount = withLazyContentVectorMigration(db, () => {
+    const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
+    return row.count;
+  });
+  if (legacyCount === 0) {
+    return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
+  }
+
+  const sample = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN content c ON c.hash = cv.hash
+    WHERE cv.model = ? AND cv.embed_fingerprint = ''
+    GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
+    ORDER BY cv.hash, cv.seq
+    LIMIT 1
+  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
+
+  if (!sample) {
+    return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
+  }
+
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) {
+    return { checked: false, adopted: 0, reason: "vectors_vec table is missing" };
+  }
+
+  const expectedHashSeq = `${sample.hash}_${sample.seq}`;
+  const title = extractTitle(sample.body, sample.path);
+  const llm = getLlm(store);
+
+  return await withLLMSessionForLlm(llm, async (session) => {
+    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+    const chunk = chunks[sample.seq];
+    if (!chunk) {
+      return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
+    }
+
+    const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+    if (!result) {
+      return { checked: true, adopted: 0, reason: "failed to embed legacy sample" };
+    }
+
+    const nearest = db.prepare(`
+      SELECT hash_seq, distance
+      FROM vectors_vec
+      WHERE embedding MATCH ? AND k = 1
+    `).get(new Float32Array(result.embedding)) as { hash_seq: string; distance: number } | undefined;
+
+    if (!nearest) {
+      return { checked: true, adopted: 0, reason: "legacy sample vector not found" };
+    }
+
+    const threshold = 0.0001;
+    if (nearest.hash_seq !== expectedHashSeq || nearest.distance > threshold) {
+      return { checked: true, adopted: 0, reason: `legacy sample differs from current fingerprint (nearest ${nearest.hash_seq}, distance ${nearest.distance.toFixed(6)})` };
+    }
+
+    const update = withLazyContentVectorMigration(db, () => db.prepare(`UPDATE content_vectors SET embed_fingerprint = ? WHERE model = ? AND embed_fingerprint = ''`).run(fingerprint, model));
+    return { checked: true, adopted: update.changes, reason: `sample ${expectedHashSeq} matched current fingerprint at distance ${nearest.distance.toFixed(6)}` };
+  });
+}
 
 export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
   const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
@@ -2103,36 +2430,38 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
-  // Count orphaned vectors first
-  const countResult = db.prepare(`
-    SELECT COUNT(*) as c FROM content_vectors cv
-    WHERE NOT EXISTS (
-      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-    )
-  `).get() as { c: number };
-
-  if (countResult.c === 0) {
-    return 0;
-  }
-
-  // Delete from vectors_vec first
-  db.exec(`
-    DELETE FROM vectors_vec WHERE hash_seq IN (
-      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+  return withLazyContentVectorMigration(db, () => {
+    // Count orphaned vectors first
+    const countResult = db.prepare(`
+      SELECT COUNT(*) as c FROM content_vectors cv
       WHERE NOT EXISTS (
         SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
       )
-    )
-  `);
+    `).get() as { c: number };
 
-  // Delete from content_vectors
-  db.exec(`
-    DELETE FROM content_vectors WHERE hash NOT IN (
-      SELECT hash FROM documents WHERE active = 1
-    )
-  `);
+    if (countResult.c === 0) {
+      return 0;
+    }
 
-  return countResult.c;
+    // Delete from vectors_vec first
+    db.exec(`
+      DELETE FROM vectors_vec WHERE hash_seq IN (
+        SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+        WHERE NOT EXISTS (
+          SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        )
+      )
+    `);
+
+    // Delete from content_vectors
+    db.exec(`
+      DELETE FROM content_vectors WHERE hash NOT IN (
+        SELECT hash FROM documents WHERE active = 1
+      )
+    `);
+
+    return countResult.c;
+  });
 }
 
 /**
@@ -2278,12 +2607,34 @@ export function findOrMigrateLegacyDocument(
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
 
-  const legacy = db.prepare(`
+  // Case-insensitive match (legacy normalization: e.g. "README.md" → "readme.md").
+  const legacyCase = db.prepare(`
     SELECT id, hash, title FROM documents
     WHERE collection = ? AND path COLLATE NOCASE = ? AND active = 1
     ORDER BY id
     LIMIT 1
   `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+
+  // Handalized-path match: existing DBs indexed with handelize() stored slugged paths
+  // like "Budget-Revenue-Q4-2024.md" for a raw path like "Budget & Revenue (Q4) [2024].md".
+  // Try matching the handalized form of the incoming raw path against the DB so that
+  // qmd update on an old index can rename the row to the literal path.
+  let legacyHandalized: { id: number; hash: string; title: string } | undefined;
+  try {
+    const handleized = handelize(path);
+    if (handleized !== path) {
+      legacyHandalized = db.prepare(`
+        SELECT id, hash, title FROM documents
+        WHERE collection = ? AND path = ? AND active = 1
+        ORDER BY id
+        LIMIT 1
+      `).get(collectionName, handleized) as { id: number; hash: string; title: string } | undefined;
+    }
+  } catch {
+    // handelize throws on invalid paths; just skip
+  }
+
+  const legacy = legacyCase ?? legacyHandalized;
   if (!legacy) return null;
 
   // Wrap rename + FTS rebuild in a transaction for atomicity.
@@ -3035,6 +3386,27 @@ function sanitizeHyphenatedTerm(term: string): string {
 }
 
 /**
+ * Check if a token is a dotted version/version-like string (e.g., 2026.4.10, 3.14.0).
+ * Returns true if splitting on dots yields at least 2 non-empty parts consisting of
+ * word/digit characters only. This avoids incorrectly splitting tokens with leading/
+ * trailing dots. Version strings like "2026.4.10" split into ["2026","4","10"] (3 parts).
+ */
+function isDottedToken(token: string): boolean {
+  const parts = token.split('.');
+  return parts.length >= 2 && parts.every(p => p.length > 0 && /^[\p{L}\p{N}_]+$/u.test(p));
+}
+
+/**
+ * Sanitize a dotted term into individual FTS5 tokens joined with AND.
+ * e.g. "2026.4.10" → '"2026"* AND "4"* AND "10"*'
+ * The AND ensures all parts must appear, matching how the porter tokenizer
+ * indexes dotted strings.
+ */
+function sanitizeDottedTerm(term: string): string {
+  return term.split('.').map(t => sanitizeFTS5Term(t)).filter(t => t).map(t => `"${t}"*`).join(' AND ');
+}
+
+/**
  * Parse lex query syntax into FTS5 query.
  *
  * Supports:
@@ -3108,6 +3480,24 @@ function buildFTS5Query(query: string): string | null {
             negative.push(ftsPhrase);
           } else {
             positive.push(ftsPhrase);
+          }
+        }
+      } else if (isDottedToken(term)) {
+        // Handle dotted version strings: 2026.4.10, 3.14.0, v1.2.3
+        // The porter tokenizer splits on dots, so the index has individual tokens.
+        // We AND all parts together so the query matches documents containing all parts.
+        const sanitized = sanitizeDottedTerm(term);
+        if (sanitized) {
+          // sanitizeDottedTerm already wraps each part in quotes with prefix match
+          if (negated) {
+            // Wrap multi-token AND expression in parens for NOT negation
+            negative.push(`(${sanitized})`);
+          } else {
+            // Flatten individual AND'd terms into the positive list so they combine
+            // correctly with other terms (avoids double-wrapping in outer AND).
+            for (const part of sanitized.split(' AND ')) {
+              positive.push(part.trim());
+            }
           }
         }
       } else if (containsCjk(term)) {
@@ -3297,10 +3687,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
     params.push(collectionName);
   }
 
-  const docRows = db.prepare(docSql).all(...params) as {
+  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
     display_path: string; title: string; body: string;
-  }[];
+  }[]);
 
   // Combine with distances and dedupe by filepath
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
@@ -3353,21 +3743,21 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Returns hash, document body, and a sample path for display purposes.
  */
 export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
-  const expectedChunksExpr = contentVectorExpectedChunksExpr(db);
-  return db.prepare(`
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
-      SELECT hash, model, COUNT(*) AS chunk_count, ${expectedChunksExpr} AS expected_chunks
+      SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
       FROM content_vectors
-      WHERE model = ?
-      GROUP BY hash, model
+      WHERE model = ? AND embed_fingerprint = ?
+      GROUP BY hash, model, embed_fingerprint
     ) v ON d.hash = v.hash
     WHERE d.active = 1
       AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all(model) as { hash: string; body: string; path: string }[];
+  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
 }
 
 /**
@@ -3409,30 +3799,32 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
     .get();
 
-  if (vecTableExists) {
-    const hashSeqRows = db.prepare(`
-      SELECT cv.hash, cv.seq
-      FROM content_vectors cv
-      WHERE cv.hash IN (${exclusiveHashesQuery})
-    `).all(collection) as { hash: string; seq: number }[];
+  withLazyContentVectorMigration(db, () => {
+    if (vecTableExists) {
+      const hashSeqRows = db.prepare(`
+        SELECT cv.hash, cv.seq
+        FROM content_vectors cv
+        WHERE cv.hash IN (${exclusiveHashesQuery})
+      `).all(collection) as { hash: string; seq: number }[];
 
-    const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
-    for (const row of hashSeqRows) {
-      delVec.run(`${row.hash}_${row.seq}`);
+      const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+      for (const row of hashSeqRows) {
+        delVec.run(`${row.hash}_${row.seq}`);
+      }
     }
-  }
 
-  db.prepare(`
-    DELETE FROM content_vectors
-    WHERE hash IN (${exclusiveHashesQuery})
-  `).run(collection);
+    db.prepare(`
+      DELETE FROM content_vectors
+      WHERE hash IN (${exclusiveHashesQuery})
+    `).run(collection);
 
-  const remaining = db
-    .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
-    .get() as { n: number };
-  if (remaining.n === 0) {
-    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
-  }
+    const remaining = db
+      .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
+      .get() as { n: number };
+    if (remaining.n === 0) {
+      db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    }
+  });
 }
 
 /**
@@ -3453,39 +3845,44 @@ export function insertEmbedding(
   embedding: Float32Array,
   model: string,
   embeddedAt: string,
-  totalChunks: number = 1
+  totalChunks: number = 1,
+  fingerprint: string = getEmbeddingFingerprint(model)
 ): void {
   const hashSeq = `${hash}_${seq}`;
 
-  // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?)`);
-  insertContentVectorStmt.run(hash, seq, pos, model, totalChunks, embeddedAt);
+  withLazyContentVectorMigration(db, () => {
+    // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
+    const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    insertContentVectorStmt.run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
 
-  // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
-  const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
-  const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  deleteVecStmt.run(hashSeq);
-  insertVecStmt.run(hashSeq, embedding);
+    // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
+    const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+    const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+    deleteVecStmt.run(hashSeq);
+    insertVecStmt.run(hashSeq, embedding);
+  });
 }
 
 function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
-  let removed = 0;
-  const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
-  const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
-  const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+  return withLazyContentVectorMigration(db, () => {
+    let removed = 0;
+    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
+    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
+    const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
 
-  for (const [hash, expectedChunks] of expectedChunksByHash) {
-    const rows = rowsStmt.all(hash, model) as { seq: number }[];
-    if (rows.length === 0 || rows.length === expectedChunks) continue;
+    for (const [hash, expectedChunks] of expectedChunksByHash) {
+      const rows = rowsStmt.all(hash, model) as { seq: number }[];
+      if (rows.length === 0 || rows.length === expectedChunks) continue;
 
-    for (const row of rows) {
-      deleteVecStmt.run(`${hash}_${row.seq}`);
+      for (const row of rows) {
+        deleteVecStmt.run(`${hash}_${row.seq}`);
+      }
+      deleteContentStmt.run(hash, model);
+      removed += rows.length;
     }
-    deleteContentStmt.run(hash, model);
-    removed += rows.length;
-  }
 
-  return removed;
+    return removed;
+  });
 }
 
 // =============================================================================
@@ -3498,12 +3895,14 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
-      const parsed = JSON.parse(cached) as any[];
+      const parsed = JSON.parse(cached) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      const rows = parsed as Array<Record<string, unknown>>;
       // Migrate old cache format: { type, text } → { type, query }
-      if (parsed.length > 0 && parsed[0].query) {
-        return parsed as ExpandedQuery[];
-      } else if (parsed.length > 0 && parsed[0].text) {
-        return parsed.map((r: any) => ({ type: r.type, query: r.text }));
+      if (rows.length > 0 && typeof rows[0]?.query === "string") {
+        return rows.map((r) => ({ type: r.type as ExpandedQuery["type"], query: String(r.query) }));
+      } else if (rows.length > 0 && typeof rows[0]?.text === "string") {
+        return rows.map((r) => ({ type: r.type as ExpandedQuery["type"], query: String(r.text) }));
       }
     } catch {
       // Old cache format (pre-typed, newline-separated text) — re-expand
@@ -3707,6 +4106,63 @@ type DbDocRow = {
   body?: string;
 };
 
+function normalizeLookupPathForIgnore(path: string): string {
+  let normalized = path.replace(/\\/g, '/').trim();
+  if (normalized.startsWith('~/')) {
+    normalized = homedir() + normalized.slice(1);
+  }
+  return normalized;
+}
+
+function matchesIgnoreRule(relativePath: string, rule: string): boolean {
+  const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const normalizedRule = rule.replace(/\\/g, '/').replace(/^\/+/, '');
+  const isMatch = picomatch(normalizedRule, { dot: true });
+  return isMatch(normalizedPath);
+}
+
+function getIgnoredLookupMatch(db: Database, query: string): DocumentExcludedByIgnore | null {
+  const normalizedQuery = normalizeLookupPathForIgnore(query);
+  const parsedVirtual = isVirtualPath(normalizedQuery) ? parseVirtualPath(normalizedQuery) : null;
+  const collections = getStoreCollections(db);
+
+  for (const coll of collections) {
+    if (!coll.ignore || coll.ignore.length === 0) continue;
+
+    const candidates: string[] = [];
+
+    if (parsedVirtual) {
+      if (parsedVirtual.collectionName !== coll.name) continue;
+      candidates.push(parsedVirtual.path);
+    } else if (normalizedQuery.startsWith(coll.path + '/')) {
+      candidates.push(normalizedQuery.slice(coll.path.length + 1));
+    } else if (!normalizedQuery.startsWith('/')) {
+      const collectionPrefix = `${coll.name}/`;
+      if (normalizedQuery.startsWith(collectionPrefix)) {
+        candidates.push(normalizedQuery.slice(collectionPrefix.length));
+      } else {
+        candidates.push(normalizedQuery);
+      }
+    }
+
+    for (const candidate of candidates) {
+      for (const rule of coll.ignore) {
+        if (matchesIgnoreRule(candidate, rule)) {
+          return {
+            error: "excluded_by_ignore",
+            query,
+            collection: coll.name,
+            path: candidate,
+            rule,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Find a document by filename/path, docid (#hash), or with fuzzy matching.
  * Returns document metadata without body by default.
@@ -3717,7 +4173,7 @@ type DbDocRow = {
  * - Relative paths: path/to/file.md
  * - Short docid: #abc123 (first 6 chars of hash)
  */
-export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
+export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentLookupError {
   let filepath = filename;
   const colonMatch = filepath.match(/:(\d+)$/);
   if (colonMatch) {
@@ -3800,6 +4256,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
   }
 
   if (!doc) {
+    const ignored = getIgnoredLookupMatch(db, filepath);
+    if (ignored) return ignored;
+
     const similar = findSimilarFiles(db, filepath, 5, 5);
     return { error: "not_found", query: filename, similarFiles: similar };
   }

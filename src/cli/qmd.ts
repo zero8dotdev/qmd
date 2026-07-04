@@ -1,5 +1,5 @@
-import { openDatabase } from "../db.js";
-import type { Database } from "../db.js";
+import { isBun, openDatabase } from "../db.js";
+import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -21,8 +21,7 @@ import {
   removeCollection,
   renameCollection,
   findSimilarFiles,
-  findDocumentByDocid,
-  isDocid,
+  findDocument,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -31,6 +30,7 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
+  getEmbeddingFingerprint,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -68,17 +68,19 @@ import {
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
+  DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
   reindexCollection,
   generateEmbeddings,
+  maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -98,11 +100,14 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  saveConfig,
   setConfigSource,
   findLocalConfigPath,
   getLocalDbPath,
   getConfigPath,
   configExists,
+  type CollectionConfig,
+  type ModelsConfig,
 } from "../collections.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
@@ -125,15 +130,14 @@ function getStore(): ReturnType<typeof createStore> {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
     try {
+      const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
-        }));
-      }
+      setDefaultLlamaCpp(new LlamaCpp({
+        embedModel: activeModels.embed,
+        generateModel: activeModels.generate,
+        rerankModel: activeModels.rerank,
+      }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -220,10 +224,8 @@ type FinishSuccessfulCliCommandOptions = {
   format?: OutputFormat;
   cleanup?: () => Promise<void>;
   exit?: (code: number) => void;
-  immediateExit?: (code: number) => void;
   stdout?: CliLifecycleWritable;
   stderr?: CliLifecycleWritable;
-  platform?: NodeJS.Platform;
 };
 
 async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
@@ -232,43 +234,34 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
   });
 }
 
-function shouldBypassNativeCleanup(options: FinishSuccessfulCliCommandOptions): boolean {
-  return (
-    (options.platform ?? process.platform) === "darwin" &&
-    options.command === "query" &&
-    options.format === "json" &&
-    process.env.QMD_DISABLE_DARWIN_QUERY_JSON_SAFE_EXIT !== "1"
-  );
-}
-
-function immediateProcessExit(code: number): void {
-  const processWithReallyExit = process as NodeJS.Process & { reallyExit?: (code?: number) => void };
-  if (typeof processWithReallyExit.reallyExit === "function") {
-    processWithReallyExit.reallyExit(code);
-    return;
-  }
-  process.exit(code);
-}
-
 /**
- * Finish a successful CLI command after output has been flushed. On macOS JSON
- * query runs, skip normal native teardown and use Node/Bun's immediate exit path:
- * ggml Metal can abort from C++ finalizers after valid JSON has already been
- * produced (#368). This wrapper is only reached after the command completed, so
- * real query failures still exit through the normal error path before this runs.
+ * Finish a successful CLI command after output has been flushed.
+ *
+ * We deliberately do NOT call `process.exit(0)`. `process.exit()` skips
+ * Node's `beforeExit` event, and node-llama-cpp registers a `beforeExit` hook
+ * that auto-disposes its native handles. On darwin, without that hook firing,
+ * libggml-metal's static `ggml_metal_device` destructor asserts on a
+ * non-empty residency-set collection during `__cxa_finalize_ranges` and
+ * dumps a multi-kB backtrace (upstream ggml-org/llama.cpp#22593, fix open as
+ * PR #22595). Empirically, even with explicit `disposeDefaultLlamaCpp()` the
+ * direct `process.exit(0)` path still trips the assertion — letting the
+ * event loop drain naturally is what actually clears the rsets.
+ *
+ * So: set `process.exitCode = 0` and return. The main module finishes, the
+ * event loop drains, `beforeExit` fires, native resources tear down in
+ * order, and the process exits cleanly. The `GGML_METAL_NO_RESIDENCY=1` env
+ * var that `bin/qmd` exports is a defense-in-depth safety net for paths
+ * that still call `process.exit()` after loading the native binding
+ * (signal handlers, error paths, `bun test`).
+ *
+ * If the caller passes an explicit `exit` for testability, we honor it —
+ * the lifecycle tests verify the legacy flush → cleanup → exit ordering.
+ * Production callers must not pass `exit`.
  */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
-  const exit = options.exit ?? ((code: number) => process.exit(code));
-  const immediateExit = options.immediateExit ?? immediateProcessExit;
 
   await flushWritable(options.stdout ?? process.stdout);
-
-  if (shouldBypassNativeCleanup(options)) {
-    await flushWritable(stderr);
-    immediateExit(0);
-    return;
-  }
 
   try {
     await (options.cleanup ?? disposeDefaultLlamaCpp)();
@@ -278,7 +271,13 @@ export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCom
     );
   }
   await flushWritable(stderr);
-  exit(0);
+
+  if (options.exit) {
+    options.exit(0);
+    return;
+  }
+
+  process.exitCode = 0;
 }
 
 // Ensure cursor is restored on exit
@@ -388,6 +387,80 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function sameDirectory(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return pathResolve(a) === pathResolve(b);
+  }
+}
+
+function initLocalIndex(): void {
+  const cwd = getPwd();
+  if (sameDirectory(cwd, homedir())) {
+    throw new Error("Refusing to initialize a local index in $HOME. The global index is automatically created; run `qmd collection add <path>` for the global index, or run `qmd init` inside a project folder.");
+  }
+
+  const qmdDir = pathJoin(cwd, ".qmd");
+  const ymlPath = pathJoin(qmdDir, "index.yml");
+  const yamlPath = pathJoin(qmdDir, "index.yaml");
+  const configPath = existsSync(yamlPath) ? yamlPath : ymlPath;
+  const dbPath = pathJoin(qmdDir, "index.sqlite");
+
+  mkdirSync(qmdDir, { recursive: true });
+  setConfigSource({ configPath });
+  storeDbPathOverride = dbPath;
+  closeDb();
+
+  if (!existsSync(configPath)) {
+    saveConfig({
+      collections: {},
+      models: resolveModels(),
+    });
+  } else {
+    ensureModelsConfiguredForCli();
+  }
+
+  const localStore = createStore(dbPath);
+  syncConfigToDb(localStore.db, loadConfig());
+  localStore.close();
+
+  console.log("ready to go with new local index");
+}
+
+function isForceCpuEnabled(): boolean {
+  const value = process.env.QMD_FORCE_CPU;
+  return !!value && !["false", "off", "none", "disable", "disabled", "0"].includes(value.trim().toLowerCase());
+}
+
+function configuredGpuModeLabel(): string {
+  return isForceCpuEnabled()
+    ? "CPU forced (QMD_FORCE_CPU)"
+    : (process.env.QMD_LLAMA_GPU?.trim() || "auto");
+}
+
+function summarizeDeviceNames(names: string[]): string {
+  const counts = new Map<string, number>();
+  for (const name of names) {
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+    .join(", ");
+}
+
+function sanitizeDiagnosticMessage(message: string): string {
+  const home = homedir();
+  return message
+    .replaceAll(home, "~")
+    .replaceAll(process.cwd(), ".")
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+    .join("; ");
 }
 
 async function showStatus(): Promise<void> {
@@ -544,50 +617,6 @@ async function showStatus(): Promise<void> {
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
-  // Device / GPU info
-  // Important: probing node-llama-cpp can abort the whole process on machines with
-  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
-  // Keep the native probe opt-in, but always show how QMD is configured and how to probe.
-  console.log(`\n${c.bold}Device${c.reset}`);
-  const configuredGpuMode = process.env.QMD_FORCE_CPU && !["false", "off", "none", "disable", "disabled", "0"].includes(process.env.QMD_FORCE_CPU.trim().toLowerCase())
-    ? "CPU forced (QMD_FORCE_CPU)"
-    : (process.env.QMD_LLAMA_GPU?.trim() || "auto");
-  console.log(`  Mode:     ${configuredGpuMode}`);
-  if (process.env.QMD_STATUS_DEVICE_PROBE !== "1") {
-    console.log(`  Status:   ${c.dim}not probed${c.reset} (set QMD_STATUS_DEVICE_PROBE=1 to test GPU/CPU backend)`);
-  } else {
-    console.log(`  Status:   probing native llama backend...`);
-    try {
-      const llm = getDefaultLlamaCpp();
-      const device = await llm.getDeviceInfo({ allowBuild: false });
-      if (device.gpu) {
-        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-        if (device.gpuDevices.length > 0) {
-          // Deduplicate and count GPUs
-          const counts = new Map<string, number>();
-          for (const name of device.gpuDevices) {
-            counts.set(name, (counts.get(name) || 0) + 1);
-          }
-          const deviceStr = Array.from(counts.entries())
-            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-            .join(', ');
-          console.log(`  Devices:  ${deviceStr}`);
-        }
-        if (device.vram) {
-          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-        }
-      } else {
-        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
-      }
-      console.log(`  CPU:      ${device.cpuCores} math cores`);
-    } catch (error) {
-      console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
-      if (error instanceof Error && error.message) {
-        console.log(`  ${c.dim}${error.message}${c.reset}`);
-      }
-    }
-  }
 
   // Tips section
   const tips: string[] = [];
@@ -916,169 +945,100 @@ function contextRemove(pathArg: string): void {
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
 }
 
-function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
-  // Parse :linenum suffix from filename (e.g., "file.md:100")
+/**
+ * Render an absolute filesystem path for human display under --full-path.
+ *
+ * If the path is the current working directory or a subpath of it, return a
+ * "./"-prefixed relative path so it is unambiguously a filesystem path (not a
+ * bare collection-relative string that could be confused for a `qmd://`
+ * fragment). Otherwise return the absolute realpath so symlinks resolve
+ * consistently. Returns `null` if the path could not be normalized — callers
+ * fall back to whatever they had before.
+ */
+function renderFullPath(absolutePath: string, cwd: string = process.cwd()): string {
+  let real: string;
+  try { real = realpathSync(absolutePath); } catch { real = absolutePath; }
+  const cwdReal = (() => { try { return realpathSync(cwd); } catch { return cwd; } })();
+  if (real === cwdReal) return "./";
+  if (real.startsWith(cwdReal + "/")) {
+    const rel = relativePath(cwdReal, real);
+    if (rel && !rel.startsWith("..")) return `./${rel}`;
+  }
+  return real;
+}
+
+function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean, fullPath: boolean = false): void {
+  // Parse :line suffix from filename. Two forms:
+  //   "file.md:100"     -> start at line 100
+  //   "file.md:100:40"  -> start at line 100, read 40 lines
+  // The :// in virtual paths is never matched because we anchor digits to $.
+  // Explicit --from/-l flags always win over values parsed from the path.
   let inputPath = filename;
-  const colonMatch = inputPath.match(/:(\d+)$/);
-  if (colonMatch && !fromLine) {
-    const matched = colonMatch[1];
-    if (matched) {
-      fromLine = parseInt(matched, 10);
-      inputPath = inputPath.slice(0, -colonMatch[0].length);
+  const rangeMatch = inputPath.match(/:(\d+):(\d+)$/);
+  if (rangeMatch) {
+    if (fromLine === undefined) fromLine = parseInt(rangeMatch[1]!, 10);
+    if (maxLines === undefined) maxLines = parseInt(rangeMatch[2]!, 10);
+    inputPath = inputPath.slice(0, -rangeMatch[0].length);
+  } else {
+    const colonMatch = inputPath.match(/:(\d+)$/);
+    if (colonMatch) {
+      const matched = colonMatch[1];
+      if (matched) {
+        if (fromLine === undefined) fromLine = parseInt(matched, 10);
+        inputPath = inputPath.slice(0, -colonMatch[0].length);
+      }
     }
   }
   if (fromLine !== undefined) fromLine = Math.max(1, fromLine);
 
   const parsedIndexPath = isVirtualPath(inputPath) ? parseVirtualPath(inputPath) : null;
-  if (parsedIndexPath?.indexName) {
-    setIndexName(parsedIndexPath.indexName);
-    setConfigIndexName(parsedIndexPath.indexName);
+  if (parsedIndexPath) {
+    if (parsedIndexPath.indexName) {
+      setIndexName(parsedIndexPath.indexName);
+      setConfigIndexName(parsedIndexPath.indexName);
+    }
+    inputPath = buildVirtualPath(parsedIndexPath.collectionName, parsedIndexPath.path);
   }
 
   const db = getDb();
-
-  // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
-  if (isDocid(inputPath)) {
-    const docidMatch = findDocumentByDocid(db, inputPath);
-    if (docidMatch) {
-      inputPath = docidMatch.filepath;
+  const doc = findDocument(db, inputPath, { includeBody: true });
+  if ("error" in doc) {
+    if (doc.error === "excluded_by_ignore") {
+      console.error(`Document is excluded by ignore rule: ${filename}`);
+      console.error(`Collection: ${doc.collection}`);
+      console.error(`Matched path: ${doc.path}`);
+      console.error(`Ignore rule: ${doc.rule}`);
     } else {
       console.error(`Document not found: ${filename}`);
-      closeDb();
-      process.exit(1);
-    }
-  }
-  let doc: { collectionName: string; path: string; body: string } | null = null;
-  let virtualPath: string;
-
-  // Handle virtual paths (qmd://collection/path)
-  if (isVirtualPath(inputPath)) {
-    const parsed = parseVirtualPath(inputPath);
-    if (!parsed) {
-      console.error(`Invalid virtual path: ${inputPath}`);
-      closeDb();
-      process.exit(1);
-    }
-
-    // Try exact match on collection + path
-    doc = db.prepare(`
-      SELECT d.collection as collectionName, d.path, content.doc as body
-      FROM documents d
-      JOIN content ON content.hash = d.hash
-      WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    `).get(parsed.collectionName, parsed.path) as typeof doc;
-
-    if (!doc) {
-      // Try fuzzy match by path ending
-      doc = db.prepare(`
-        SELECT d.collection as collectionName, d.path, content.doc as body
-        FROM documents d
-        JOIN content ON content.hash = d.hash
-        WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-        LIMIT 1
-      `).get(parsed.collectionName, `%${parsed.path}`) as typeof doc;
-    }
-
-    virtualPath = inputPath;
-  } else {
-    // Try to interpret as collection/path format first (before filesystem path)
-    // If path is relative (no / or ~ prefix), check if first component is a collection name
-    if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
-      const parts = inputPath.split('/');
-      if (parts.length >= 2) {
-        const possibleCollection = parts[0];
-        const possiblePath = parts.slice(1).join('/');
-
-        // Check if this collection exists
-        const collExists = possibleCollection ? db.prepare(`
-          SELECT 1 FROM documents WHERE collection = ? AND active = 1 LIMIT 1
-        `).get(possibleCollection) : null;
-
-        if (collExists) {
-          // Try exact match on collection + path
-          doc = db.prepare(`
-            SELECT d.collection as collectionName, d.path, content.doc as body
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(possibleCollection || "", possiblePath || "") as { collectionName: string; path: string; body: string } | null;
-
-          if (!doc) {
-            // Try fuzzy match by path ending
-            doc = db.prepare(`
-              SELECT d.collection as collectionName, d.path, content.doc as body
-              FROM documents d
-              JOIN content ON content.hash = d.hash
-              WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
-              LIMIT 1
-            `).get(possibleCollection || "", `%${possiblePath}`) as { collectionName: string; path: string; body: string } | null;
-          }
-
-          if (doc) {
-            virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-            // Skip the filesystem path handling below
-          }
-        }
+      if (doc.similarFiles.length > 0) {
+        console.error("Similar files:");
+        for (const file of doc.similarFiles) console.error(`  ${file}`);
       }
     }
-
-    // If not found as collection/path, handle as filesystem paths
-    if (!doc) {
-      let fsPath = inputPath;
-
-      // Expand ~ to home directory
-      if (fsPath.startsWith('~/')) {
-        fsPath = homedir() + fsPath.slice(1);
-      } else if (!fsPath.startsWith('/')) {
-        // Relative path - resolve from current directory
-        fsPath = resolve(getPwd(), fsPath);
-      }
-      fsPath = getRealPath(fsPath);
-
-      // Try to detect which collection contains this path
-      const detected = detectCollectionFromPath(db, fsPath);
-
-      if (detected) {
-        // Found collection - query by collection name + relative path
-        doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(detected.collectionName, detected.relativePath) as { collectionName: string; path: string; body: string } | null;
-      }
-
-      // Fuzzy match by filename (last component of path)
-      if (!doc) {
-        const filename = inputPath.split('/').pop() || inputPath;
-        doc = db.prepare(`
-          SELECT d.collection as collectionName, d.path, content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1
-          LIMIT 1
-        `).get(`%${filename}`) as { collectionName: string; path: string; body: string } | null;
-      }
-
-      if (doc) {
-        virtualPath = buildVirtualPath(doc.collectionName, doc.path);
-      } else {
-        virtualPath = inputPath;
-      }
-    }
-  }
-
-  // Ensure doc is not null before proceeding
-  if (!doc) {
-    console.error(`Document not found: ${filename}`);
     closeDb();
     process.exit(1);
   }
 
-  // Get context for this file
-  const context = getContextForPath(db, doc.collectionName, doc.path);
+  // `findDocument` already computes the docid (first 6 hash chars) and the
+  // canonical display path, so we reuse them here instead of a second lookup.
+  const docid = doc.docid;
+  const canonicalPath = `qmd://${doc.displayPath}`;
 
-  let output = doc.body;
+  // --full-path: show the on-disk path instead of the qmd:// URL + docid, when
+  // the file actually exists. Fall back to the canonical header otherwise.
+  let header: string;
+  if (fullPath) {
+    const fsPath = resolveVirtualPath(db, canonicalPath);
+    if (fsPath && existsSync(fsPath)) {
+      header = renderFullPath(fsPath);
+    } else {
+      header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
+    }
+  } else {
+    header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
+  }
+
+  let output = doc.body || "";
   const startLine = fromLine || 1;
 
   // Apply line filtering if specified
@@ -1089,21 +1049,25 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     output = lines.slice(start, end).join('\n');
   }
 
-  // Add line numbers if requested
+  // Line numbers are on by default (disable with --no-line-numbers) so the
+  // model can cite exact lines and request follow-up ranges via path:from:count.
   if (lineNumbers) {
     output = addLineNumbers(output, startLine);
   }
 
-  // Output context header if exists
-  if (context) {
-    console.log(`Folder Context: ${context}\n---\n`);
+  // Header: identify the document (path + docid, or the on-disk path with
+  // --full-path), then optional context.
+  console.log(header);
+  if (doc.context) {
+    console.log(`Folder Context: ${doc.context}`);
   }
+  console.log("---\n");
   console.log(output);
   closeDb();
 }
 
 // Multi-get: fetch multiple documents by glob pattern or comma-separated list
-function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES, format: OutputFormat = "cli"): void {
+function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT_MULTI_GET_MAX_BYTES, format: OutputFormat = "cli", lineNumbers: boolean = true, fullPath: boolean = false): void {
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
@@ -1191,7 +1155,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   }
 
   // Collect results for structured output
-  const results: { file: string; displayPath: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
+  const results: { file: string; displayPath: string; fsPath?: string; docid?: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
 
   for (const file of files) {
     // Parse virtual path to get collection info if not already available
@@ -1209,11 +1173,30 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     // Get context using collection-scoped function
     const context = collection && path ? getContextForPath(db, collection, path) : null;
 
+    // Resolve docid (first 6 chars of content hash) so every entry can be cited.
+    const docidRow = collection && path ? db.prepare(`
+      SELECT d.hash as hash
+      FROM documents d
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(collection, path) as { hash: string } | null : null;
+    const docid = docidRow?.hash ? docidRow.hash.slice(0, 6) : undefined;
+
+    // --full-path: resolve the on-disk path when it exists (else fall back).
+    // Display as ./-prefixed relative path when under $PWD; absolute realpath
+    // otherwise. See renderFullPath() for the policy.
+    let fsPath: string | undefined;
+    if (fullPath) {
+      const resolved = resolveVirtualPath(db, file.filepath);
+      if (resolved && existsSync(resolved)) fsPath = renderFullPath(resolved);
+    }
+
     // Check size limit
     if (file.bodyLength > maxBytes) {
       results.push({
         file: file.filepath,
         displayPath: file.displayPath,
+        fsPath,
+        docid,
         title: file.displayPath.split('/').pop() || file.displayPath,
         body: "",
         context,
@@ -1246,9 +1229,16 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       }
     }
 
+    // Line numbers on by default (disable with --no-line-numbers).
+    if (lineNumbers) {
+      body = addLineNumbers(body);
+    }
+
     results.push({
       file: file.filepath,
       displayPath: file.displayPath,
+      fsPath,
+      docid,
       title: doc.title || file.displayPath.split('/').pop() || file.displayPath,
       body,
       context,
@@ -1258,14 +1248,23 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
 
   closeDb();
 
+  // --full-path replaces the qmd:// path + docid with the on-disk path (when it
+  // resolved). Per result: pick the identifier and whether to show the docid.
+  const identOf = (r: typeof results[number]): string => (fullPath && r.fsPath) ? r.fsPath : r.displayPath;
+  const docidOf = (r: typeof results[number]): string | undefined => (fullPath && r.fsPath) ? undefined : r.docid;
+
   // Output based on format
   if (format === "json") {
-    const output = results.map(r => ({
-      file: r.displayPath,
-      title: r.title,
-      ...(r.context && { context: r.context }),
-      ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
-    }));
+    const output = results.map(r => {
+      const docidVal = docidOf(r);
+      return {
+        file: identOf(r),
+        ...(docidVal && { docid: `#${docidVal}` }),
+        title: r.title,
+        ...(r.context && { context: r.context }),
+        ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
+      };
+    });
     console.log(JSON.stringify(output, null, 2));
   } else if (format === "csv") {
     const escapeField = (val: string | null | undefined): string => {
@@ -1276,19 +1275,24 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       }
       return str;
     };
-    console.log("file,title,context,skipped,body");
+    console.log("docid,file,title,context,skipped,body");
     for (const r of results) {
-      console.log([r.displayPath, r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
+      const docidVal = docidOf(r);
+      console.log([docidVal ? `#${docidVal}` : "", identOf(r), r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
     }
   } else if (format === "files") {
     for (const r of results) {
+      const docidVal = docidOf(r);
+      const id = docidVal ? `#${docidVal} ` : "";
       const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
       const status = r.skipped ? "[SKIPPED]" : "";
-      console.log(`${r.displayPath}${ctx}${status ? `,${status}` : ""}`);
+      console.log(`${id}${identOf(r)}${ctx}${status ? `,${status}` : ""}`);
     }
   } else if (format === "md") {
     for (const r of results) {
-      console.log(`## ${r.displayPath}\n`);
+      const docidVal = docidOf(r);
+      console.log(`## ${identOf(r)}\n`);
+      if (docidVal) console.log(`**docid:** \`#${docidVal}\`\n`);
       if (r.title && r.title !== r.displayPath) console.log(`**Title:** ${r.title}\n`);
       if (r.context) console.log(`**Context:** ${r.context}\n`);
       if (r.skipped) {
@@ -1303,8 +1307,10 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
     console.log('<?xml version="1.0" encoding="UTF-8"?>');
     console.log("<documents>");
     for (const r of results) {
-      console.log("  <document>");
-      console.log(`    <file>${escapeXml(r.displayPath)}</file>`);
+      const docidVal = docidOf(r);
+      const docidAttr = docidVal ? ` docid="#${docidVal}"` : "";
+      console.log(`  <document${docidAttr}>`);
+      console.log(`    <file>${escapeXml(identOf(r))}</file>`);
       console.log(`    <title>${escapeXml(r.title)}</title>`);
       if (r.context) console.log(`    <context>${escapeXml(r.context)}</context>`);
       if (r.skipped) {
@@ -1319,8 +1325,10 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   } else {
     // CLI format (default)
     for (const r of results) {
+      const docidVal = docidOf(r);
+      const id = docidVal ? `  #${docidVal}` : "";
       console.log(`\n${'='.repeat(60)}`);
-      console.log(`File: ${r.displayPath}`);
+      console.log(`File: ${identOf(r)}${id}`);
       console.log(`${'='.repeat(60)}\n`);
 
       if (r.skipped) {
@@ -1445,7 +1453,7 @@ function listFiles(pathArg?: string): void {
 
   // List files in the collection with size and modification time
   let query: string;
-  let params: any[];
+  let params: SQLiteValue[];
 
   if (pathPrefix) {
     // List files under a specific path
@@ -1689,13 +1697,14 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    const path = handelize(relativeFile); // Normalize path for token-friendliness
+    // Store the literal relative path — handelize() is NOT applied at index time.
+    const path = relativeFile.replace(/\\/g, '/');
     seenPaths.add(path);
 
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch (err: any) {
+    } catch {
       // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
       processed++;
       progress.set((processed / total) * 100);
@@ -1802,42 +1811,59 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
 }
 
-export function resolveEmbedModelForCli(): string {
-  try {
-    return resolveEmbedModel(loadConfig().models);
-  } catch {
-    return resolveEmbedModel();
+// --timeout for `qmd embed`: a cap on the whole embed session, in minutes. Returns
+// the value in milliseconds, or undefined to use the default. 0 disables the cap.
+function parseEmbedTimeoutOption(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    throw new Error(`--timeout must be a non-negative number of minutes (0 = no limit)`);
   }
+  return minutes * 60 * 1000;
 }
 
-export function resolveGenerateModelForCli(): string {
+function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
-    return resolveGenerateModel(loadConfig().models);
-  } catch {
-    return resolveGenerateModel();
-  }
-}
-
-export function resolveRerankModelForCli(): string {
-  try {
-    return resolveRerankModel(loadConfig().models);
-  } catch {
-    return resolveRerankModel();
-  }
-}
-
-function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
-  try {
-    return resolveModels(loadConfig().models);
+    const config = loadConfig();
+    const models = resolveModels(config.models);
+    const current = config.models ?? {};
+    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+      saveConfig({
+        ...config,
+        models: {
+          ...current,
+          embed: models.embed,
+          generate: models.generate,
+          rerank: models.rerank,
+        },
+      });
+    }
+    return models;
   } catch {
     return resolveModels();
   }
 }
 
+export function resolveEmbedModelForCli(): string {
+  return ensureModelsConfiguredForCli().embed;
+}
+
+export function resolveGenerateModelForCli(): string {
+  return ensureModelsConfiguredForCli().generate;
+}
+
+export function resolveRerankModelForCli(): string {
+  return ensureModelsConfiguredForCli().rerank;
+}
+
+function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
+  return ensureModelsConfiguredForCli();
+}
+
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -1854,7 +1880,7 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -1872,23 +1898,31 @@ async function vectorIndex(
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
+    maxDurationMs: batchOptions?.maxDurationMs,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
-      const percent = (info.bytesProcessed / info.totalBytes) * 100;
+      // Progress is measured by input bytes, not by chunks. The final chunk
+      // count is discovered lazily batch-by-batch, so displaying
+      // chunksEmbedded/totalChunks makes the percent look wrong when a few
+      // large documents remain. Show chunks as a count and label the byte
+      // percentage explicitly as input progress.
+      const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
       progress.set(percent);
 
       const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = info.bytesProcessed / elapsed;
-      const remainingBytes = info.totalBytes - info.bytesProcessed;
-      const etaSec = remainingBytes / bytesPerSec;
+      const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
+      const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
+      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
 
       const bar = renderProgressBar(percent);
       const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = `${formatBytes(bytesPerSec)}/s`;
-      const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-      const errStr = info.errors > 0 ? ` ${c.yellow}${info.errors} err${c.reset}` : "";
+      const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
+      const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
+      const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
+      const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
+      const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
 
-      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${info.chunksEmbedded}/${info.totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
     },
   });
 
@@ -1903,7 +1937,13 @@ async function vectorIndex(
     console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
     console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
     if (result.errors > 0) {
-      console.log(`${c.yellow}⚠ ${result.errors} chunks failed${c.reset}`);
+      console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
+      for (const failure of (result.failures ?? []).slice(0, 8)) {
+        console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
+      }
+      if ((result.failures?.length ?? 0) > 8) {
+        console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+      }
     }
   }
 
@@ -1966,6 +2006,7 @@ type OutputOptions = {
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
+  fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2116,6 +2157,21 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     );
   };
 
+  // Helper to pick the visible path for a result. With --full-path we swap
+  // the qmd:// URI for the file's on-disk path via renderFullPath() (./-
+  // prefixed relative when under $PWD, absolute realpath otherwise). Falls
+  // back to qmd:// if the file is no longer resolvable on disk.
+  const linkDbForPaths = opts.fullPath ? getDb() : null;
+  const displayPathFor = (row: OutputRow): string => {
+    // Always rebuild from displayPath so the active index name is included
+    // as ?index=… for non-default indexes. row.file may not carry it.
+    const qmdUri = toQmdPath(row.displayPath);
+    if (!opts.fullPath || !linkDbForPaths) return qmdUri;
+    const absolute = resolveVirtualPath(linkDbForPaths, qmdUri);
+    if (!absolute || !existsSync(absolute)) return qmdUri;
+    return renderFullPath(absolute);
+  };
+
   if (opts.format === "json") {
     // JSON output for LLM consumption
     const output = filtered.map(row => {
@@ -2127,10 +2183,11 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
       }
+      // With --full-path, omit docid (the on-disk path is the identifier).
       return {
-        ...(docid && { docid: `#${docid}` }),
+        ...(docid && !opts.fullPath && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
-        file: toQmdPath(row.displayPath),
+        file: displayPathFor(row),
         line: snippetInfo.line,
         title: row.title,
         ...(row.context && { context: row.context }),
@@ -2145,7 +2202,12 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (const row of filtered) {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const ctx = row.context ? `,"${row.context.replace(/"/g, '""')}"` : "";
-      console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
+      if (opts.fullPath) {
+        // --full-path: drop the docid, the on-disk path is the identifier.
+        console.log(`${row.score.toFixed(2)},${displayPathFor(row)}${ctx}`);
+      } else {
+        console.log(`#${docid},${row.score.toFixed(2)},${displayPathFor(row)}${ctx}`);
+      }
     }
   } else if (opts.format === "cli") {
     const editorUriTemplate = getEditorUriTemplate();
@@ -2158,26 +2220,32 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const virtualPath = row.file.startsWith("qmd://") ? row.file : toQmdPath(row.displayPath);
+      // Default: show the full qmd:// URI so the user can see which collection
+      // a hit lives in and can pipe the same string straight back into
+      // `qmd get`. A bare collection-relative path like `sources/foo.md` is
+      // ambiguous: it's not a real filesystem path, not a URI, and not a
+      // shell-friendly identifier on its own.
+      // With --full-path the visible label is the file's on-disk path
+      // ($PWD-relative when in a subfolder; absolute realpath otherwise),
+      // and the docid is omitted because the path is the identifier.
+      const virtualPath = toQmdPath(row.displayPath);
       const parsed = parseVirtualPath(virtualPath);
       const absolutePath = resolveVirtualPath(linkDb, virtualPath);
-
-      const legacyPath = toQmdPath(row.displayPath);
-      const displayPath = parsed?.path || row.displayPath;
+      const visiblePath = displayPathFor(row);
 
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
-      const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
+      const docidStr = (docid && !opts.fullPath) ? ` ${c.dim}#${docid}${c.reset}` : "";
 
       if (process.stdout.isTTY && absolutePath && parsed?.path) {
         const linkLine = hasMatch ? line : 1;
         const linkTarget = buildEditorUri(editorUriTemplate, absolutePath, linkLine, 1);
-        const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
+        const clickable = termLink(`${visiblePath}${lineInfo}`, linkTarget);
         console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
       } else {
-        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+        console.log(`${c.cyan}${visiblePath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
       }
 
       // Line 2: Title (if available)
@@ -2230,15 +2298,18 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const heading = row.title || row.displayPath;
+      const visiblePath = displayPathFor(row);
+      const heading = row.title || visiblePath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      const docidLine = docid ? `**docid:** \`#${docid}\`\n` : "";
+      const fileLine = `**file:** \`${visiblePath}\`\n`;
+      // With --full-path the on-disk path is the identifier; drop the docid line.
+      const docidLine = (docid && !opts.fullPath) ? `**docid:** \`#${docid}\`\n` : "";
       const contextLine = row.context ? `**context:** ${row.context}\n` : "";
-      console.log(`---\n# ${heading}\n${docidLine}${contextLine}\n${content}\n`);
+      console.log(`---\n# ${heading}\n${fileLine}${docidLine}${contextLine}\n${content}\n`);
     }
   } else if (opts.format === "xml") {
     for (const row of filtered) {
@@ -2249,11 +2320,15 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      console.log(`<file docid="#${docid}" name="${toQmdPath(row.displayPath)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
+      const docidAttr = opts.fullPath ? "" : ` docid="#${docid}"`;
+      console.log(`<file${docidAttr} name="${displayPathFor(row)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
     }
   } else {
     // CSV format
-    console.log("docid,score,file,title,context,line,snippet");
+    const csvHeader = opts.fullPath
+      ? "score,file,title,context,line,snippet"
+      : "docid,score,file,title,context,line,snippet";
+    console.log(csvHeader);
     for (const row of filtered) {
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       let content = opts.full ? row.body : snippet;
@@ -2262,7 +2337,13 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const snippetText = content || "";
-      console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toQmdPath(row.displayPath))},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`);
+      const path = escapeCSV(displayPathFor(row));
+      const tail = `${path},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`;
+      if (opts.fullPath) {
+        console.log(`${row.score.toFixed(4)},${tail}`);
+      } else {
+        console.log(`#${docid},${row.score.toFixed(4)},${tail}`);
+      }
     }
   }
 }
@@ -2651,6 +2732,9 @@ function parseCLI() {
       "min-score": { type: "string" },
       all: { type: "boolean" },
       full: { type: "boolean" },
+      format: { type: "string" },          // preferred: --format cli|json|csv|md|xml|files
+      // Legacy boolean format aliases. Kept working for back-compat but
+      // omitted from the documented help; prefer `--format <kind>`.
       csv: { type: "boolean" },
       md: { type: "boolean" },
       xml: { type: "boolean" },
@@ -2665,6 +2749,7 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
+      timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2672,7 +2757,9 @@ function parseCLI() {
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
-      "line-numbers": { type: "boolean" },  // add line numbers to output
+      "line-numbers": { type: "boolean" },  // add line numbers to output (search; default on for get/multi-get)
+      "no-line-numbers": { type: "boolean" },  // disable line numbers for get/multi-get
+      "full-path": { type: "boolean" },  // show on-disk paths instead of qmd:// (get/multi-get/search/query)
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
@@ -2684,6 +2771,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2711,9 +2799,21 @@ function parseCLI() {
     }
   }
 
-  // Determine output format
+  // Determine output format. Prefer --format <kind>; fall back to the
+  // legacy boolean aliases (--csv/--md/--xml/--files/--json) which remain
+  // wired up for back-compat but are no longer documented.
   let format: OutputFormat = "cli";
-  if (values.csv) format = "csv";
+  const rawFormat = typeof values.format === "string" ? values.format.toLowerCase().trim() : "";
+  const VALID_FORMATS: ReadonlyArray<OutputFormat> = ["cli", "json", "csv", "md", "xml", "files"];
+  if (rawFormat) {
+    if ((VALID_FORMATS as ReadonlyArray<string>).includes(rawFormat)) {
+      format = rawFormat as OutputFormat;
+    } else {
+      console.error(`Unknown --format value: ${values.format}`);
+      console.error(`Valid: ${VALID_FORMATS.join(", ")}`);
+      process.exit(1);
+    }
+  } else if (values.csv) format = "csv";
   else if (values.md) format = "md";
   else if (values.xml) format = "xml";
   else if (values.files) format = "files";
@@ -2737,6 +2837,7 @@ function parseCLI() {
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
+    fullPath: !!values["full-path"],
   };
 
   return {
@@ -2929,6 +3030,35 @@ function copyDirectoryContents(sourceDir: string, targetDir: string): void {
   }
 }
 
+function installedSkillStubContent(): string {
+  return `---
+name: qmd
+description: Bootstrap QMD search instructions from the installed qmd CLI. Use when users ask to find notes, retrieve documents, inspect a wiki, or answer from indexed local markdown.
+license: MIT
+compatibility: Requires qmd CLI. Run \`qmd skill show\` for version-matched instructions.
+allowed-tools: Bash(qmd:*), mcp__qmd__*
+---
+
+# QMD - Query Markdown Documents
+
+This installed skill is intentionally a small bootstrap so it does not go stale
+when the qmd package updates.
+
+Load the full, version-matched QMD instructions from the CLI:
+
+!\`qmd skill show\`
+
+If your agent does not support bang-command expansion, run:
+
+\`\`\`bash
+qmd skill show
+\`\`\`
+
+Then follow those instructions. In short: search first, fetch full sources with
+\`qmd get\` or \`qmd multi-get\`, and answer from retrieved text rather than snippets.
+`;
+}
+
 function writeSkillInstall(targetDir: string, force: boolean): void {
   if (pathExists(targetDir)) {
     if (!force) {
@@ -2943,6 +3073,7 @@ function writeSkillInstall(targetDir: string, force: boolean): void {
   }
 
   copyDirectoryContents(skill.dir, targetDir);
+  writeFileSync(resolve(targetDir, "SKILL.md"), installedSkillStubContent(), "utf-8");
 }
 
 function outputSkillsJson(payload: unknown): void {
@@ -3138,7 +3269,7 @@ function showHelp(): void {
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
-  console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
+  console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
@@ -3151,11 +3282,13 @@ function showHelp(): void {
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
   console.log("");
   console.log("Maintenance:");
+  console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
+  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -3205,33 +3338,635 @@ function showHelp(): void {
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
-  console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
+  console.log("  -n <num>                   - Max results (default 5, or 20 for --format files|json)");
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
-  console.log("  --line-numbers             - Include line numbers in output");
-  console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
-  console.log("  --files | --json | --csv | --md | --xml  - Output format");
+  console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
+  console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
+  console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
+  console.log("                                Paths are ./-prefixed when under $PWD, absolute otherwise");
+  console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
+  console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
+  console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
-  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 10240)");
-  console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
+  console.log("  --max-bytes <num>          - Skip files larger than N bytes (default 65536)");
+  console.log("  --format <kind>            - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
 
-async function showVersion(): Promise<void> {
+function doctorCheck(label: string, ok: boolean, details: string): void {
+  const mark = ok ? `${c.green}✓${c.reset}` : `${c.yellow}⚠${c.reset}`;
+  console.log(`${mark} ${label}: ${details}`);
+}
+
+function formatCount(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+function shortModelName(model: string): string {
+  if (model.startsWith("hf:")) {
+    return model.split("/").pop() || model;
+  }
+  return model.length > 56 ? `${model.slice(0, 53)}...` : model;
+}
+
+function normalizedDoctorNextSteps(steps: string[]): string[] {
+  const unique = Array.from(new Set(steps));
+  const hasForceEmbed = unique.some(step => step.includes("qmd embed --force"));
+  if (!hasForceEmbed) return unique;
+  return unique.filter(step => !step.includes("qmd embed") || step.startsWith("Run `qmd embed --force`"));
+}
+
+function shortHashSeq(hashSeq: string): string {
+  const idx = hashSeq.lastIndexOf("_");
+  if (idx < 0) return hashSeq.length > 18 ? `${hashSeq.slice(0, 18)}...` : hashSeq;
+  return `${hashSeq.slice(0, 12)}_${hashSeq.slice(idx + 1)}`;
+}
+
+type DoctorVectorSampleResult = {
+  ok: boolean;
+  details: string;
+};
+
+function decodeStoredEmbedding(bytes: Uint8Array): Float32Array {
+  return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+
+function cosineDistance(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  if (a.length !== b.length || a.length === 0) return Number.POSITIVE_INFINITY;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    dot += av * bv;
+    normA += av * av;
+    normB += bv * bv;
+  }
+  if (normA === 0 || normB === 0) return Number.POSITIVE_INFINITY;
+  return 1 - (dot / (Math.sqrt(normA) * Math.sqrt(normB)));
+}
+
+type CachedModelInspection = {
+  path: string | null;
+  invalid: string[];
+};
+
+function formatModelDiagnosticPath(path: string): string {
+  return sanitizeDiagnosticMessage(path);
+}
+
+function findCachedModelInspection(model: string): CachedModelInspection {
+  const invalid: string[] = [];
+  if (model.startsWith("hf:")) {
+    const filename = model.split("/").pop();
+    if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
+    const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      // Skip the `<filename>.etag` HTTP sidecar that `qmd pull` writes next to
+      // each blob. It satisfies `includes(filename)` but is not a GGUF, so
+      // inspecting it as one surfaces a spurious "invalid" model in `qmd
+      // doctor` whenever readdir happens to yield the sidecar before the blob.
+      if (!entry.isFile() || entry.name.endsWith(".etag") || !entry.name.includes(filename)) continue;
+      const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
+      const inspection = inspectGgufFile(candidate);
+      if (inspection.valid) return { path: candidate, invalid };
+      invalid.push(`${formatModelDiagnosticPath(candidate)}: ${inspection.details}`);
+    }
+    return { path: null, invalid };
+  }
+
+  const inspection = inspectGgufFile(model);
+  if (inspection.valid) return { path: model, invalid };
+  if (inspection.exists) invalid.push(`${formatModelDiagnosticPath(model)}: ${inspection.details}`);
+  return { path: null, invalid };
+}
+
+type EnvOverride = {
+  name: string;
+  value: string;
+  consequence: string;
+};
+
+function envValueForDisplay(value: string): string {
+  const sanitized = sanitizeDiagnosticMessage(value);
+  return sanitized.length > 96 ? `${sanitized.slice(0, 93)}...` : sanitized;
+}
+
+function collectEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): EnvOverride[] {
+  const overrides: EnvOverride[] = [];
+  const add = (name: string, consequence: string) => {
+    const raw = process.env[name]?.trim();
+    if (!raw) return;
+    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+  };
+  const addModel = (name: string, key: "embed" | "generate" | "rerank", active: string) => {
+    const raw = process.env[name]?.trim();
+    if (!raw) return;
+    const configured = configModels[key];
+    const consequence = configured && configured !== raw
+      ? `set but ignored because index models.${key} is configured as ${configured}`
+      : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
+    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+  };
+
+  add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
+  add("QMD_CONFIG_DIR", "overrides the QMD config directory and takes precedence over XDG_CONFIG_HOME");
+  add("XDG_CONFIG_HOME", "moves QMD config to $XDG_CONFIG_HOME/qmd when QMD_CONFIG_DIR is not set");
+  add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID files");
+  addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
+  addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
+  addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
+  add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
+  add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
+  add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
+  add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
+  add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
+  add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
+  add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
+  add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
+  add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
+  add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#22593)");
+  add("GGML_METAL_NO_RESIDENCY", "set automatically by the launcher on darwin to disable Metal residency sets (avoids ggml-org/llama.cpp#22593); override via QMD_METAL_KEEP_RESIDENCY=1");
+  add("NO_COLOR", "disables colored terminal output");
+  add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
+  add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
+  add("QMD_WRAPPER_CAPTURE", "test/debug hook for the qmd shell wrapper; should not be set in normal use");
+  add("WSL_DISTRO_NAME", "enables WSL path handling heuristics");
+  add("WSL_INTEROP", "enables WSL path handling heuristics");
+  return overrides;
+}
+
+type DoctorConfigCheck = {
+  config: CollectionConfig | null;
+  valid: boolean;
+};
+
+function checkDoctorIndexConfig(nextSteps: string[]): DoctorConfigCheck {
+  try {
+    const config = loadConfig();
+    const collectionCount = Object.keys(config.collections ?? {}).length;
+    if (collectionCount === 0) {
+      doctorCheck("index config", false, "no collections configured. Next: `qmd collection add .`");
+      nextSteps.push("Run `qmd collection add . --name <name>` from the folder you want to index, or edit .qmd/index.yml manually.");
+    } else {
+      doctorCheck("index config", true, `${formatCount(collectionCount)} ${collectionCount === 1 ? "collection" : "collections"} configured`);
+    }
+    return { config, valid: true };
+  } catch (error) {
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    const configPath = getConfigPath();
+    doctorCheck("index config", false, `invalid index.yml at ${configPath}: ${message}. Next: fix the YAML and rerun \`qmd doctor\``);
+    nextSteps.push(`Fix invalid YAML in ${configPath}, then rerun \`qmd doctor\`.`);
+    return { config: null, valid: false };
+  }
+}
+
+function checkEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
+  const overrides = collectEnvironmentOverrides(activeModels, configModels);
+  if (overrides.length === 0) {
+    doctorCheck("environment overrides", true, "none");
+    return;
+  }
+
+  doctorCheck("environment overrides", false, `${overrides.length} set`);
+  for (const override of overrides) {
+    console.log(`  - ${override.name}=${override.value}: ${override.consequence}`);
+  }
+}
+
+function checkModelDefaults(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
+  const checks = [
+    { role: "embedding", key: "embed", active: activeModels.embed, configured: configModels.embed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
+    { role: "generation", key: "generate", active: activeModels.generate, configured: configModels.generate, defaultModel: DEFAULT_QUERY_MODEL, envName: "QMD_GENERATE_MODEL", envValue: process.env.QMD_GENERATE_MODEL },
+    { role: "reranking", key: "rerank", active: activeModels.rerank, configured: configModels.rerank, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
+  ] as const;
+
+  const notes: string[] = [];
+  for (const check of checks) {
+    const envValue = check.envValue?.trim();
+    if (envValue && check.active === envValue) {
+      notes.push(`${check.role}: env ${check.envName}=${check.active} (default ${check.defaultModel}; might be ok)`);
+    } else if (check.configured && check.configured !== check.defaultModel) {
+      notes.push(`${check.role}: index ${check.configured} (default ${check.defaultModel}; might be ok)`);
+    } else if (envValue && check.active !== envValue) {
+      notes.push(`${check.role}: ${check.envName} is set to ${envValue} but index config uses ${check.active}`);
+    }
+  }
+
+  if (notes.length === 0) {
+    doctorCheck("model defaults", true, "using QMD codebase defaults");
+    return;
+  }
+
+  doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
+}
+
+function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
+  const models = [
+    ["embedding", activeModels.embed],
+    ["generation", activeModels.generate],
+    ["reranking", activeModels.rerank],
+  ] as const;
+  const unique = new Map<string, string[]>();
+  for (const [role, model] of models) {
+    unique.set(model, [...(unique.get(model) ?? []), role]);
+  }
+
+  const missing: string[] = [];
+  const cached: string[] = [];
+  const invalid: string[] = [];
+  for (const [model, roles] of unique) {
+    const label = `${roles.join("+")}: ${model}`;
+    const inspection = findCachedModelInspection(model);
+    invalid.push(...inspection.invalid.map(detail => `${label} (${detail})`));
+    if (inspection.path) {
+      cached.push(label);
+    } else {
+      missing.push(label);
+    }
+  }
+
+  if (missing.length === 0 && invalid.length === 0) {
+    doctorCheck("model cache", true, `${cached.length} active ${cached.length === 1 ? "model is" : "models are"} downloaded and valid GGUF`);
+    return;
+  }
+
+  const parts: string[] = [];
+  if (invalid.length > 0) parts.push(`invalid ${invalid.length}: ${invalid.join("; ")}`);
+  if (missing.length > 0) parts.push(`missing ${missing.length}/${unique.size}: ${missing.join("; ")}`);
+  const next = invalid.length > 0
+    ? "Next: run `qmd pull --refresh` (or remove the bad cached file)"
+    : "Next: run `qmd pull`";
+  doctorCheck("model cache", false, `${parts.join("; ")}. ${next}`);
+  if (invalid.length > 0) {
+    nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
+  } else {
+    nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
+  }
+}
+
+async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
+  const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
+  if (activeDocs === 0) {
+    return { ok: true, details: "no active documents indexed" };
+  }
+
+  const vecTableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!vecTableExists) {
+    return { ok: false, details: "no vector table to test; please run qmd embed again" };
+  }
+
+  const samples = db.prepare(`
+    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN content c ON c.hash = cv.hash
+    WHERE cv.model = ? AND cv.embed_fingerprint = ?
+    GROUP BY cv.hash, cv.seq, c.doc
+    ORDER BY random()
+    LIMIT ?
+  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+
+  if (samples.length === 0) {
+    return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
+  }
+
+  const threshold = 0.0001;
+  const mismatches: string[] = [];
+
+  await withLLMSession(async (session) => {
+    for (const sample of samples) {
+      const hashSeq = `${sample.hash}_${sample.seq}`;
+      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunk = chunks[sample.seq];
+      if (!chunk) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
+        continue;
+      }
+
+      const title = extractTitle(sample.body, sample.path);
+      const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+      if (!result) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: embedding failed`);
+        continue;
+      }
+
+      const stored = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`).get(hashSeq) as { embedding: Uint8Array } | undefined;
+      if (!stored) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: stored vector missing`);
+        continue;
+      }
+
+      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored.embedding));
+      if (distance > threshold) {
+        mismatches.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
+      }
+    }
+  }, { maxDuration: 10 * 60 * 1000, name: "doctorEmbeddingVectorSample" });
+
+  if (mismatches.length > 0) {
+    return {
+      ok: false,
+      details: `${mismatches.length}/${samples.length} sampled chunks differ from stored vectors (${mismatches[0]}). Rebuild with \`qmd embed --force\``,
+    };
+  }
+
+  return {
+    ok: true,
+    details: `${samples.length} sampled ${samples.length === 1 ? "chunk" : "chunks"} reproduce stored vectors`,
+  };
+}
+
+function hasLibraryInDirs(libraryBaseName: string, dirs: string[]): boolean {
+  for (const dir of dirs) {
+    if (!dir || !existsSync(dir)) continue;
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry === libraryBaseName || entry.startsWith(`${libraryBaseName}.`)) return true;
+      }
+    } catch { /* ignore unreadable system library dirs */ }
+  }
+  return false;
+}
+
+function linuxCudaRuntimeDiagnostic(): string | null {
+  if (process.platform !== "linux") return null;
+
+  const dirs = new Set<string>();
+  for (const value of [process.env.LD_LIBRARY_PATH, process.env.CUDA_PATH]) {
+    for (const part of (value ?? "").split(":")) {
+      if (part) dirs.add(part);
+    }
+  }
+  if (process.env.CUDA_PATH) {
+    dirs.add(pathJoin(process.env.CUDA_PATH, "lib64"));
+    dirs.add(pathJoin(process.env.CUDA_PATH, "targets", "x86_64-linux", "lib"));
+  }
+  for (const dir of ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64", "/usr/local/cuda/targets/x86_64-linux/lib"]) {
+    dirs.add(dir);
+  }
+  try {
+    for (const entry of readdirSync("/usr/local")) {
+      if (!entry.toLowerCase().startsWith("cuda-")) continue;
+      const cudaRoot = pathJoin("/usr/local", entry);
+      dirs.add(pathJoin(cudaRoot, "lib64"));
+      dirs.add(pathJoin(cudaRoot, "targets", "x86_64-linux", "lib"));
+    }
+  } catch { /* /usr/local may not be readable in restricted environments */ }
+
+  const searchDirs = [...dirs];
+  const hasDriver = hasLibraryInDirs("libcuda.so", searchDirs) || hasLibraryInDirs("libnvidia-ml.so", searchDirs);
+  if (!hasDriver) return null;
+
+  const cudaLibraries: [library: string, label: string][] = [
+    ["libcudart.so", "CUDA runtime"],
+    ["libcublas.so", "cuBLAS"],
+    ["libcublasLt.so", "cuBLASLt"],
+  ];
+  const missing = cudaLibraries
+    .filter(([library]) => !hasLibraryInDirs(library, searchDirs))
+    .map(([, label]) => label);
+
+  if (missing.length === 0) return null;
+  return `NVIDIA driver libraries are visible, but CUDA user-space libraries are missing from loader paths (${missing.join(", ")})`;
+}
+
+async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
+  const mode = configuredGpuModeLabel();
+  doctorCheck("device mode", true, mode);
+
+  const skipProbe = ["0", "false", "off", "no", "skip"].includes((process.env.QMD_DOCTOR_DEVICE_PROBE ?? "").trim().toLowerCase());
+  if (skipProbe) {
+    doctorCheck("device probe", false, "skipped by QMD_DOCTOR_DEVICE_PROBE=0. Next: unset it and rerun `qmd doctor` to verify GPU/CPU acceleration");
+    nextSteps.push("Unset `QMD_DOCTOR_DEVICE_PROBE` and rerun `qmd doctor` when you want to verify llama.cpp device acceleration.");
+    return;
+  }
+
+  const crashHint = "Probing native llama backend now. If qmd crashes here, rerun with `QMD_FORCE_CPU=1 qmd doctor` (or `QMD_DOCTOR_DEVICE_PROBE=0 qmd doctor` to skip this probe).";
+  if (process.stdout.isTTY) {
+    process.stdout.write(`${c.dim}${crashHint}${c.reset}`);
+  }
+
+  try {
+    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+    }
+    if (device.gpu) {
+      const gpuLabel = device.gpu === "metal" && process.platform === "darwin"
+        ? "metal (macOS Metal backend)"
+        : String(device.gpu);
+      const parts = [`GPU ${gpuLabel}`, `offloading ${device.gpuOffloading ? "enabled" : "disabled"}`];
+      if (device.gpuDevices.length > 0) parts.push(`devices: ${summarizeDeviceNames(device.gpuDevices)}`);
+      if (device.vram) parts.push(`VRAM ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+      parts.push(`${device.cpuCores} CPU math cores`);
+      doctorCheck("device probe", device.gpuOffloading, device.gpuOffloading
+        ? parts.join("; ")
+        : `${parts.join("; ")}. Next: check QMD_LLAMA_GPU and llama.cpp backend support`);
+      if (!device.gpuOffloading) {
+        nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
+      }
+
+      // Surface the darwin residency-set mitigation. libggml-metal's
+      // process-static device dtor asserts on un-expired residency sets
+      // during libc exit() (ggml-org/llama.cpp#22593), producing a giant
+      // stderr backtrace after correct output. The bin/qmd launcher exports
+      // GGML_METAL_NO_RESIDENCY=1 on darwin to skip the assertion entirely.
+      // No measurable perf cost on short-lived CLI calls.
+      if (device.gpu === "metal" && process.platform === "darwin") {
+        if (isDarwinMetalMitigationActive()) {
+          doctorCheck(
+            "darwin metal residency",
+            true,
+            "GGML_METAL_NO_RESIDENCY=1 set by launcher; clean process exit (avoids ggml-org/llama.cpp#22593). Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you run long-lived qmd processes."
+          );
+        } else {
+          doctorCheck(
+            "darwin metal residency",
+            false,
+            "residency sets active (QMD_METAL_KEEP_RESIDENCY=1 or launcher bypassed); llama-using commands may dump a libggml-metal backtrace at exit (ggml-org/llama.cpp#22593) even when output succeeded."
+          );
+          nextSteps.push("Unset `QMD_METAL_KEEP_RESIDENCY` so the launcher can disable Metal residency sets; without this, query/vsearch/embed dump a stack trace at exit even on success.");
+        }
+      }
+    } else {
+      const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
+      const diagnosticSuffix = cudaDiagnostic ? ` ${cudaDiagnostic}.` : "";
+      doctorCheck("device probe", false, `running on CPU (${device.cpuCores} math cores).${diagnosticSuffix} Next: install/configure Metal, CUDA, or Vulkan for faster embeddings, or set QMD_FORCE_CPU=1 to make CPU mode explicit`);
+      if (cudaDiagnostic) {
+        nextSteps.push(`${cudaDiagnostic}; install CUDA runtime/cuBLAS libraries or add their directory to LD_LIBRARY_PATH, then rerun \`qmd doctor\`.`);
+      } else {
+        nextSteps.push("Vector operations are running on CPU; install/configure Metal, CUDA, or Vulkan if embedding/query performance is too slow.");
+      }
+    }
+  } catch (error) {
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+    }
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    doctorCheck("device probe", false, `probe failed: ${message}. Next: run with QMD_FORCE_CPU=1 to bypass GPU probing, or set QMD_LLAMA_GPU=metal|cuda|vulkan and retry`);
+    nextSteps.push("GPU probe failed; try `QMD_FORCE_CPU=1 qmd doctor` to confirm CPU fallback, then fix GPU drivers/backend if acceleration is expected.");
+  }
+}
+
+async function showDoctor(): Promise<void> {
+  const storeInstance = getStore();
+  const db = storeInstance.db;
+  const pkg = readPackageJson();
+  const activeModels = resolveModelsForCli();
+  const embedModel = activeModels.embed;
+  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const nextSteps: string[] = [];
+
+  console.log(`${c.bold}QMD Doctor${c.reset}\n`);
+  console.log(`Index: ${getDbPath()}`);
+  console.log(`Runtime: ${isBun ? "bun:sqlite" : "better-sqlite3"}`);
+
+  try {
+    const row = db.prepare(`SELECT sqlite_version() AS version`).get() as { version: string };
+    doctorCheck("SQLite runtime", true, row.version);
+  } catch (error) {
+    doctorCheck("SQLite runtime", false, error instanceof Error ? error.message : String(error));
+  }
+
+  const betterSqliteVersion = pkg.dependencies?.["better-sqlite3"] ?? pkg.devDependencies?.["better-sqlite3"] ?? "not declared";
+  doctorCheck("better-sqlite3 package", true, String(betterSqliteVersion));
+
+  try {
+    const row = db.prepare(`SELECT vec_version() AS version`).get() as { version: string };
+    doctorCheck("sqlite-vec", true, row.version);
+  } catch (error) {
+    doctorCheck("sqlite-vec", false, error instanceof Error ? error.message : String(error));
+  }
+
+  const configCheck = checkDoctorIndexConfig(nextSteps);
+  const configModels = configCheck.config?.models ?? {};
+  checkEnvironmentOverrides(activeModels, configModels);
+  checkModelDefaults(activeModels, configModels);
+  checkModelCache(activeModels, nextSteps);
+
+  await runDoctorDeviceChecks(nextSteps);
+
+  try {
+    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+    if (adoption.checked || adoption.adopted > 0) {
+      doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
+    }
+  } catch (error) {
+    doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const pending = getHashesNeedingEmbedding(db, undefined, embedModel);
+    doctorCheck("embedding freshness", pending === 0, pending === 0 ? "all active documents match current fingerprint" : `${formatCount(pending)} active documents need embeddings. Next: \`qmd embed\``);
+    if (pending > 0) {
+      nextSteps.push(`Run \`qmd embed\` to generate ${formatCount(pending)} missing/stale document embeddings.`);
+    }
+  } catch (error) {
+    doctorCheck("embedding freshness", false, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const rows = db.prepare(`
+      SELECT model, embed_fingerprint AS fingerprint, COUNT(DISTINCT hash) AS docs, COUNT(*) AS chunks
+      FROM content_vectors
+      GROUP BY model, embed_fingerprint
+      ORDER BY chunks DESC, model, embed_fingerprint
+    `).all() as { model: string; fingerprint: string; docs: number; chunks: number }[];
+    const uniqueFingerprints = new Set(rows.map(row => row.fingerprint));
+    const offCurrent = rows.filter(row => row.model === embedModel && row.fingerprint !== fingerprint);
+    const ok = rows.length === 0 || (uniqueFingerprints.size === 1 && rows[0]?.fingerprint === fingerprint && offCurrent.length === 0);
+    const currentDocs = rows
+      .filter(row => row.model === embedModel && row.fingerprint === fingerprint)
+      .reduce((sum, row) => sum + row.docs, 0);
+    const otherDocs = rows.reduce((sum, row) => sum + row.docs, 0) - currentDocs;
+    const groups = rows.map(row => {
+      const label = row.fingerprint === fingerprint ? "current" : (row.fingerprint || "legacy");
+      return `${shortModelName(row.model)}:${label} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`;
+    }).join("; ");
+    const namedFingerprintRows = rows.filter(row => row.fingerprint);
+    const namedFingerprints = [...new Set(namedFingerprintRows.map(row => row.fingerprint))];
+    if (namedFingerprints.length > 1) {
+      const namedGroups = namedFingerprintRows
+        .map(row => `${row.fingerprint}${row.fingerprint === fingerprint ? " (current)" : ""}: ${shortModelName(row.model)} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`)
+        .join("; ");
+      doctorCheck("mixed named embedding fingerprints", false, `content_vectors contains ${namedFingerprints.length} named fingerprints: ${namedGroups}. Next: \`qmd embed\` or \`qmd embed --force\``);
+      nextSteps.push("Run `qmd embed` to converge mixed named embedding fingerprints; use `qmd embed --force` if old named fingerprints or vector sample mismatches remain.");
+    }
+    const details = rows.length === 0
+      ? `no vectors yet; current fingerprint ${fingerprint}`
+      : ok
+        ? `${formatCount(currentDocs)} docs on current fingerprint (${fingerprint})`
+        : `${formatCount(currentDocs)} docs current, ${formatCount(otherDocs)} docs legacy/stale. ${groups}. Next: \`qmd embed\``;
+    doctorCheck("embedding fingerprints", ok, details);
+    if (!ok) {
+      nextSteps.push("Run `qmd embed` to migrate active documents to the current embedding fingerprint; use `qmd embed --force` if vector samples still fail afterward.");
+    }
+  } catch (error) {
+    doctorCheck("embedding fingerprints", false, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
+    if (!vectorSample.ok) {
+      nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    doctorCheck("embedding vector sample", false, `${message}; rebuild with \`qmd embed --force\``);
+    nextSteps.push("Run `qmd embed --force` to rebuild existing vectors, then rerun `qmd doctor`.");
+  }
+
+  const steps = normalizedDoctorNextSteps(nextSteps);
+  if (steps.length > 0) {
+    console.log(`\n${c.bold}Recommended next step${steps.length === 1 ? "" : "s"}${c.reset}`);
+    for (const step of steps) {
+      console.log(`  - ${step}`);
+    }
+  }
+
+  closeDb();
+}
+
+function printDoctorHint(): void {
+  console.error("If qmd still behaves unexpectedly, run 'qmd doctor' for diagnostics.");
+}
+
+function exitWithError(error: unknown, code = 1): never {
+  console.error(error instanceof Error ? error.message : String(error));
+  printDoctorHint();
+  process.exit(code);
+}
+
+type PackageJson = {
+  version: string;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+};
+
+function readPackageJson(): PackageJson {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const pkgPath = resolve(scriptDir, "..", "..", "package.json");
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+  return JSON.parse(readFileSync(pkgPath, "utf-8"));
+}
+
+async function showVersion(): Promise<void> {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const pkg = readPackageJson();
 
   let commit = "";
   try {
@@ -3368,24 +4103,28 @@ if (isMain) {
 
     case "get": {
       if (!cli.args[0]) {
-        console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
+        console.error("Usage: qmd get <filepath>[:from[:count]] [--from <line>] [-l <lines>] [--no-line-numbers] [--full-path]");
         process.exit(1);
       }
       const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
       const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      // Line numbers default ON for get; opt out with --no-line-numbers.
+      const getLineNumbers = !cli.values["no-line-numbers"];
+      getDocument(cli.args[0], fromLine, maxLines, getLineNumbers, !!cli.values["full-path"]);
       break;
     }
 
     case "multi-get": {
       if (!cli.args[0]) {
-        console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--json|--csv|--md|--xml|--files]");
+        console.error("Usage: qmd multi-get <pattern> [-l <lines>] [--max-bytes <bytes>] [--no-line-numbers] [--full-path] [--format json|csv|md|xml|files]");
         console.error("  pattern: glob (e.g., 'journals/2025-05*.md') or comma-separated list");
         process.exit(1);
       }
       const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
       const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
-      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      // Line numbers default ON for multi-get; opt out with --no-line-numbers.
+      const mgLineNumbers = !cli.values["no-line-numbers"];
+      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format, mgLineNumbers, !!cli.values["full-path"]);
       break;
     }
 
@@ -3530,13 +4269,26 @@ if (isMain) {
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
           console.error("Run 'qmd collection help' for usage");
+          printDoctorHint();
           process.exit(1);
       }
       break;
     }
 
+    case "init":
+      try {
+        initLocalIndex();
+      } catch (error) {
+        exitWithError(error);
+      }
+      break;
+
     case "status":
       await showStatus();
+      break;
+
+    case "doctor":
+      await showDoctor();
       break;
 
     case "update":
@@ -3548,6 +4300,7 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+        const embedMaxDurationMs = parseEmbedTimeoutOption(cli.values["timeout"]);
         // Validate -c against configured collections before dispatching, so a
         // typo errors with "Collection not found: X" instead of silently
         // reporting success because no pending docs match a nonexistent name.
@@ -3559,10 +4312,10 @@ if (isMain) {
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
           collection: embedCollection,
+          maxDurationMs: embedMaxDurationMs,
         });
       } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
+        exitWithError(error);
       }
       break;
 
@@ -3667,6 +4420,10 @@ if (isMain) {
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        // --host overrides the default localhost bind; QMD_HOST env is the
+        // fallback (resolved in startMcpHttpServer). Use "0.0.0.0" to accept
+        // off-host connections, e.g. a container liveness probe.
+        const host = cli.values.host ? String(cli.values.host) : undefined;
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -3686,9 +4443,10 @@ if (isMain) {
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
+          const hostArgs = host ? ["--host", host] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -3697,7 +4455,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -3708,9 +4466,9 @@ if (isMain) {
         process.removeAllListeners("SIGINT");
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath() });
-        } catch (e: any) {
-          if (e?.code === "EADDRINUSE") {
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+        } catch (e: unknown) {
+          if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
             process.exit(1);
           }
@@ -3754,8 +4512,7 @@ if (isMain) {
           try {
             await installSkill(Boolean(cli.values.global), Boolean(cli.values.force), Boolean(cli.values.yes));
           } catch (error) {
-            console.error(error instanceof Error ? error.message : String(error));
-            process.exit(1);
+            exitWithError(error);
           }
           break;
         }
@@ -3778,6 +4535,7 @@ if (isMain) {
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
           console.error("Run 'qmd skill help' for usage");
+          printDoctorHint();
           process.exit(1);
       }
       break;
@@ -3815,6 +4573,7 @@ if (isMain) {
     default:
       console.error(`Unknown command: ${cli.command}`);
       console.error("Run 'qmd --help' for usage.");
+      printDoctorHint();
       process.exit(1);
   }
 

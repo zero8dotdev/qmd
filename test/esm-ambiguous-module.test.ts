@@ -9,14 +9,14 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("Node ESM entrypoints", () => {
   test("CLI --index path normalizes via setIndexName/setConfigIndexName under Node 22+", () => {
-    execFileSync("npm", ["run", "build"], {
+    execFileSync(process.execPath, ["scripts/build.mjs"], {
       cwd: repoRoot,
       encoding: "utf-8",
       stdio: "pipe",
     });
 
     const indexPath = join(mkdtempSync(join(tmpdir(), "qmd-index-")), "nested", "idx");
-    const output = execFileSync("node", ["dist/cli/qmd.js", "--index", indexPath, "--version"], {
+    const output = execFileSync(process.execPath, ["dist/cli/qmd.js", "--index", indexPath, "--version"], {
       cwd: repoRoot,
       encoding: "utf-8",
       stdio: "pipe",

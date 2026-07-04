@@ -176,7 +176,7 @@ async function runQuery(
   let resultFiles: string[];
   try {
     resultFiles = await backend.run(store, query, limit, collection);
-  } catch (err: any) {
+  } catch {
     // Backend may not be available (e.g., no embeddings for vector search)
     return {
       precision_at_k: 0,

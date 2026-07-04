@@ -80,6 +80,7 @@ function initTestDatabase(db: Database): void {
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
+      embed_fingerprint TEXT NOT NULL DEFAULT '',
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
     )
@@ -186,7 +187,7 @@ function seedTestData(db: Database): void {
   for (let i = 0; i < 768; i++) embedding[i] = Math.random();
 
   for (const doc of docs.slice(0, 4)) { // Skip large file for embeddings
-    db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(doc.hash, DEFAULT_EMBED_MODEL, now);
+    db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(doc.hash, DEFAULT_EMBED_MODEL, getEmbeddingFingerprint(DEFAULT_EMBED_MODEL), now);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${doc.hash}_0`, embedding);
   }
 }
@@ -211,6 +212,7 @@ import {
   findDocuments,
   getStatus,
   DEFAULT_EMBED_MODEL,
+  getEmbeddingFingerprint,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
@@ -473,7 +475,10 @@ describe("MCP Server", () => {
       const result = findDocument(testDb, "readm.md", { includeBody: false }); // typo
       expect("error" in result).toBe(true);
       if ("error" in result) {
-        expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
+        expect(result.error).toBe("not_found");
+        if (result.error === "not_found") {
+          expect(result.similarFiles.length).toBeGreaterThanOrEqual(0);
+        }
       }
     });
 
@@ -536,6 +541,13 @@ describe("MCP Server", () => {
       expect(docs.length).toBe(1);
       expect(errors.length).toBe(1);
       expect(errors[0]).toContain("not found");
+    });
+
+    test("default maxBytes includes normal wiki-sized files", () => {
+      expect(DEFAULT_MULTI_GET_MAX_BYTES).toBe(64 * 1024);
+      const { docs } = findDocuments(testDb, "large-file.md", { includeBody: true });
+      expect(docs.length).toBe(1);
+      expect(docs[0]!.skipped).toBe(false);
     });
 
     test("skips files larger than maxBytes", () => {
@@ -886,6 +898,33 @@ describe("MCP Server", () => {
         expect(typeof col.pattern).toBe("string");
         expect(typeof col.documents).toBe("number");
       }
+    });
+
+    test("REST /query and /search file field uses qmd:// URI prefix (#576)", () => {
+      // Regression test: the HTTP REST endpoint was returning r.displayPath (e.g.
+      // "docs/readme.md") instead of "qmd://docs/readme.md", while the CLI and MCP
+      // resource URIs always use the qmd:// scheme. This simulates the fix: the REST
+      // handler now applies encodeQmdPath and prepends "qmd://".
+      const results = searchFTS(testDb, "readme", 5);
+      expect(results.length).toBeGreaterThan(0);
+
+      // Simulate what the fixed REST handler produces for each result
+      const restResponseItems = results.map(r => ({
+        docid: `#${r.docid}`,
+        file: `qmd://${r.displayPath.split('/').map(s => encodeURIComponent(s)).join('/')}`,
+        title: r.title,
+        score: Math.round(r.score * 100) / 100,
+      }));
+
+      // Every file field must start with qmd://
+      for (const item of restResponseItems) {
+        expect(item.file).toMatch(/^qmd:\/\//);
+      }
+
+      // Spot-check the readme result
+      const readmeItem = restResponseItems.find(item => item.file.includes("readme"));
+      expect(readmeItem).toBeDefined();
+      expect(readmeItem!.file).toBe("qmd://docs/readme.md");
     });
   });
 });

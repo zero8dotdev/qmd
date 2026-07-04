@@ -187,7 +187,8 @@ export function loadConfig(): CollectionConfig {
 
   try {
     const content = readFileSync(configPath, "utf-8");
-    const config = YAML.parse(content) as CollectionConfig;
+    const parsed = YAML.parse(content) as CollectionConfig | null | undefined;
+    const config = parsed ?? { collections: {} };
 
     // Ensure collections object exists
     if (!config.collections) {

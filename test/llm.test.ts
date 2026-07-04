@@ -263,8 +263,66 @@ describe("native llama stdout containment", () => {
 
       const stderr = String(stderrSpy.mock.calls.map(call => call[0]).join(""));
       expect(stderr.match(/no GPU acceleration/g)?.length).toBe(1);
-      expect(stderr).toContain("QMD_STATUS_DEVICE_PROBE=1 qmd status");
+      expect(stderr).toContain("qmd doctor");
+      expect(stderr).not.toContain("QMD_STATUS_DEVICE_PROBE");
     } finally {
+      stderrSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+      if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = prevGpu;
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+
+  test("embeds hello world with QMD_FORCE_CPU=1 without throwing", async () => {
+    const prevGpu = process.env.QMD_LLAMA_GPU;
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_FORCE_CPU = "1";
+    process.env.QMD_LLAMA_GPU = "metal";
+
+    const getEmbeddingFor = vi.fn(async (text: string) => ({
+      vector: new Float32Array([0.1, 0.2, 0.3]),
+      text,
+    }));
+    const createEmbeddingContext = vi.fn(async () => ({
+      getEmbeddingFor,
+      dispose: vi.fn(async () => {}),
+    }));
+    const loadModel = vi.fn(async () => ({
+      trainContextSize: 2048,
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+      createEmbeddingContext,
+      dispose: vi.fn(async () => {}),
+    }));
+    const getLlama = vi.fn(async (options: Record<string, unknown>) => ({
+      gpu: false,
+      cpuMathCores: 4,
+      loadModel,
+      dispose: vi.fn(async () => {}),
+    }) as any);
+
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(async () => "/tmp/nonexistent-model.gguf"),
+      LlamaChatSession: vi.fn() as any,
+      getLlama,
+    });
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const llm = new LlamaCpp();
+    try {
+      const result = await llm.embed("hello world");
+      expect(result).toEqual({
+        embedding: [0.10000000149011612, 0.20000000298023224, 0.30000001192092896],
+        model: llm.embedModelName,
+      });
+      expect(getLlama).toHaveBeenCalledWith(expect.objectContaining({ gpu: false, build: "never" }));
+      expect(loadModel).toHaveBeenCalledWith(expect.objectContaining({ gpuLayers: 0 }));
+      expect(getEmbeddingFor).toHaveBeenCalledWith("hello world");
+    } finally {
+      await llm.dispose();
       stderrSpy.mockRestore();
       setNodeLlamaCppModuleForTest(null);
       if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;

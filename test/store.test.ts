@@ -26,6 +26,7 @@ import {
   extractTitle,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  getEmbeddingFingerprint,
   chunkDocument,
   chunkDocumentByTokens,
   chunkDocumentAsync,
@@ -193,7 +194,7 @@ async function syncTestConfig(): Promise<void> {
 
 // Helper to create a test collection in YAML config
 async function createTestCollection(
-  options: { pwd?: string; glob?: string; name?: string } = {}
+  options: { pwd?: string; glob?: string; name?: string; ignore?: string[] } = {}
 ): Promise<string> {
   const pwd = options.pwd || "/test/collection";
   const glob = options.glob || "**/*.md";
@@ -209,6 +210,7 @@ async function createTestCollection(
   config.collections[name] = {
     path: pwd,
     pattern: glob,
+    ...(options.ignore ? { ignore: options.ignore } : {}),
   };
 
   // Write back
@@ -311,15 +313,123 @@ describe("Store Creation", () => {
 
     // Check tables exist
     const tables = store.db.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' ORDER BY name
+      SELECT name FROM sqlite_master
+      WHERE type='table'
+      ORDER BY name
     `).all() as { name: string }[];
 
     const tableNames = tables.map(t => t.name);
     expect(tableNames).toContain("documents");
     expect(tableNames).toContain("documents_fts");
     expect(tableNames).toContain("content_vectors");
+    expect(tableNames).toContain("content");
     expect(tableNames).toContain("llm_cache");
     // Note: path_contexts table removed in favor of YAML-based context storage
+
+    await cleanupTestDb(store);
+  });
+
+  test("createStore defers content_vectors embed_fingerprint migration until embedding health needs it", async () => {
+    const dbPath = join(testDir, `legacy-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    const model = "hf:test/embed-model.gguf";
+    const legacyDb = openDatabase(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE content (
+        hash TEXT PRIMARY KEY,
+        doc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        path TEXT NOT NULL,
+        title TEXT,
+        hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        modified_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+        UNIQUE(collection, path)
+      );
+      CREATE TABLE content_vectors (
+        hash TEXT NOT NULL,
+        seq INTEGER NOT NULL DEFAULT 0,
+        pos INTEGER NOT NULL DEFAULT 0,
+        model TEXT NOT NULL,
+        total_chunks INTEGER NOT NULL DEFAULT 1,
+        embedded_at TEXT NOT NULL,
+        PRIMARY KEY (hash, seq)
+      )
+    `);
+    const now = new Date().toISOString();
+    legacyDb.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`).run("hash1", "# Legacy\nbody", now);
+    legacyDb.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)`).run("test", "legacy.md", "Legacy", "hash1", now, now);
+    legacyDb.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?)`).run("hash1", 0, 0, model, 1, now);
+    legacyDb.close();
+
+    const store = createStore(dbPath);
+    let columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    expect(columns.map(col => col.name)).not.toContain("embed_fingerprint");
+
+    expect(store.getHashesNeedingEmbedding(model)).toBe(1);
+
+    columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    const migratedRow = store.db.prepare(`SELECT embed_fingerprint FROM content_vectors WHERE hash = ?`).get("hash1") as { embed_fingerprint: string };
+    expect(columns.map(col => col.name)).toContain("embed_fingerprint");
+    expect(migratedRow.embed_fingerprint).toBe("");
+
+    await cleanupTestDb(store);
+  });
+
+  test("content_vectors column repair runs the full ALTER series and retries the failed operation", async () => {
+    const dbPath = join(testDir, `legacy-no-seq-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    const model = "hf:test/embed-model.gguf";
+    const legacyDb = openDatabase(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE content (
+        hash TEXT PRIMARY KEY,
+        doc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        path TEXT NOT NULL,
+        title TEXT,
+        hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        modified_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+        UNIQUE(collection, path)
+      );
+      CREATE TABLE content_vectors (
+        hash TEXT NOT NULL,
+        model TEXT NOT NULL,
+        embed_fingerprint TEXT NOT NULL DEFAULT '',
+        total_chunks INTEGER NOT NULL DEFAULT 1,
+        embedded_at TEXT NOT NULL
+      )
+    `);
+    legacyDb.close();
+
+    const store = createStore(dbPath);
+    let columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    expect(columns.map(col => col.name)).not.toContain("seq");
+    expect(columns.map(col => col.name)).not.toContain("pos");
+
+    store.ensureVecTable(3);
+    store.insertEmbedding("hash1", 1, 42, new Float32Array([1, 2, 3]), model, new Date().toISOString(), 2);
+
+    columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    const columnNames = columns.map(col => col.name);
+    expect(columnNames).toEqual(expect.arrayContaining(["seq", "pos", "model", "embed_fingerprint", "total_chunks", "embedded_at"]));
+    expect(store.db.prepare(`SELECT seq, pos, model, total_chunks FROM content_vectors WHERE hash = ?`).get("hash1")).toEqual({
+      seq: 1,
+      pos: 42,
+      model,
+      total_chunks: 2,
+    });
 
     await cleanupTestDb(store);
   });
@@ -1495,6 +1605,39 @@ describe("FTS Search", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("searchFTS matches dotted version strings like 2026.4.10 (#563)", async () => {
+    // Regression test: porter unicode61 tokenizer splits on dots, so the index
+    // stores "2026", "4", "10" as separate tokens. Before the fix, sanitizeFTS5Term
+    // stripped the dots producing "2026410" which never matched anything.
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "release-notes",
+      title: "Release Notes",
+      body: "## Release 2026.4.10\n\nThis version introduces new features and bug fixes.",
+      displayPath: "test/release-notes.md",
+    });
+
+    // A document that does NOT contain the version string
+    await insertTestDocument(store.db, collectionName, {
+      name: "other-doc",
+      title: "Other Document",
+      body: "Unrelated content about gardening and cooking.",
+      displayPath: "test/other.md",
+    });
+
+    const results = store.searchFTS("2026.4.10", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.map(r => r.displayPath)).toContain(`${collectionName}/test/release-notes.md`);
+
+    // Partial version should also work
+    const partial = store.searchFTS("2026.4", 10);
+    expect(partial.map(r => r.displayPath)).toContain(`${collectionName}/test/release-notes.md`);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
@@ -1584,8 +1727,54 @@ describe("Document Retrieval", () => {
       expect("error" in result).toBe(true);
       if ("error" in result) {
         expect(result.error).toBe("not_found");
-        // Levenshtein distance of 1 should be found with maxDistance 3
-        expect(result.similarFiles.length).toBeGreaterThanOrEqual(0); // May or may not find depending on distance calc
+        if (result.error === "not_found") {
+          // Levenshtein distance of 1 should be found with maxDistance 3
+          expect(result.similarFiles.length).toBeGreaterThanOrEqual(0); // May or may not find depending on distance calc
+        }
+      }
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocument reports ignored files separately from missing files", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({
+        pwd: "/path",
+        ignore: ["ignored/**"],
+      });
+
+      const result = store.findDocument("/path/ignored/secret.md");
+
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error).toBe("excluded_by_ignore");
+        if (result.error === "excluded_by_ignore") {
+          expect(result.collection).toBe(collectionName);
+          expect(result.path).toBe("ignored/secret.md");
+          expect(result.rule).toBe("ignored/**");
+        }
+      }
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocument detects ignore rules for virtual paths", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({
+        name: "vault",
+        ignore: ["private/*.md"],
+      });
+
+      const result = store.findDocument("qmd://vault/private/note.md");
+
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error).toBe("excluded_by_ignore");
+        if (result.error === "excluded_by_ignore") {
+          expect(result.collection).toBe(collectionName);
+          expect(result.path).toBe("private/note.md");
+          expect(result.rule).toBe("private/*.md");
+        }
       }
 
       await cleanupTestDb(store);
@@ -1984,6 +2173,26 @@ describe("Snippet Extraction", () => {
     expect(linesAfter).toBe(2);   // Fourth, Fifth
   });
 
+  test("extractSnippet with leading blank/frontmatter lines reports 1 before, not 0", () => {
+    // Regression: a user looked at `@@ -2,4 @@ (1 before, 72 after)` and
+    // suspected "1 before" was wrong because the match appeared to be the
+    // topmost visible line. The math takes "before" from the absolute file
+    // line, not from the visible portion of the snippet — so when the
+    // snippet starts at line 2, "1 before" is the correct count. Lock that
+    // in with a 77-line document whose match sits on line 3.
+    const otherLines = Array.from({ length: 72 }, (_, i) => `body line ${i + 6}`).join("\n");
+    const body = `---\ntitle: Notes\n# Heading with keyword\nIntro paragraph.\nMore intro lines.\n${otherLines}`;
+
+    const { line, linesBefore, snippetLines, linesAfter, snippet } =
+      extractSnippet(body, "keyword", 500);
+
+    expect(line).toBe(3);             // match is on line 3
+    expect(linesBefore).toBe(1);      // exactly one line above the 4-line snippet window
+    expect(snippetLines).toBe(4);     // lines 2..5 form the snippet
+    expect(linesAfter).toBe(72);      // remaining body
+    expect(snippet).toContain("@@ -2,4 @@ (1 before, 72 after)");
+  });
+
   test("extractSnippet at document end shows 0 after", () => {
     const body = "First\nSecond\nThird\nFourth\nFifth keyword";
     const { linesBefore, linesAfter, snippetLines, line } = extractSnippet(body, "keyword", 500);
@@ -2297,6 +2506,23 @@ describe("Index Status", () => {
     expect(store.getStatus().needsEmbedding).toBe(1);
     expect(store.getIndexHealth().needsEmbedding).toBe(1);
     expect(store.getHashesNeedingEmbedding(staleModel)).toBe(0);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embedding health treats stale fingerprints as needing re-embedding", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const model = "hf:test/embed-model.gguf";
+    const now = new Date().toISOString();
+
+    store.llm = { embedModelName: model } as any;
+    store.ensureVecTable(3);
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hash1" });
+    store.insertEmbedding("hash1", 0, 0, new Float32Array([1, 2, 3]), model, now, 1, "stale1");
+
+    expect(getEmbeddingFingerprint(model)).toMatch(/^[a-f0-9]{6}$/);
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
 
     await cleanupTestDb(store);
   });
@@ -3030,6 +3256,44 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings stops early when maxDurationMs is exceeded", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    // A slow embedder so the short session cap trips between document batches.
+    const embedBatchCalls: string[][] = [];
+    const slowLlm = {
+      async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
+      async embedBatch(texts: string[]) {
+        embedBatchCalls.push([...texts]);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return texts.map((_text, index) => ({ embedding: [index + 1, index + 2, index + 3], model: "fake-embed" }));
+      },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = slowLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 1,           // one doc per batch, so the cap can stop between docs
+        maxBatchBytes: 1024 * 1024,
+        maxDurationMs: 10,            // trips ~10ms in, well before the 80ms batches finish
+      });
+
+      // The first batch runs, then the session expires and the rest are skipped.
+      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
+      expect(embedBatchCalls.length).toBeLessThan(3);
+      expect(result.chunksEmbedded).toBeLessThan(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings flushes batches when maxBatchBytes is reached", async () => {
     const store = await createTestStore();
     const db = store.db;
@@ -3116,9 +3380,13 @@ describe("Embedding batching", () => {
   test("generateEmbeddings does not mark a partially embedded multi-chunk document complete", async () => {
     const store = await createTestStore();
     const db = store.db;
+    let embedCalls = 0;
     const fakeLlm = {
       async embed(_text: string, _options?: { model?: string }) {
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+        embedCalls++;
+        return embedCalls === 1
+          ? { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }
+          : null;
       },
       async embedBatch(texts: string[], _options?: { model?: string }) {
         return texts.map((_text, index) => index === 0
@@ -3140,10 +3408,47 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store);
 
       expect(result.errors).toBeGreaterThan(0);
+      expect(result.failures?.[0]?.attempts).toBe(3);
       expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 0 });
       expect(db.prepare(`SELECT COUNT(*) as count FROM vectors_vec`).get()).toEqual({ count: 0 });
       expect(store.getHashesNeedingEmbedding()).toBe(1);
       expect(store.getStatus().needsEmbedding).toBe(1);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings clears chunk errors after successful retry", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = {
+      async embed(_text: string, _options?: { model?: string }) {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[], _options?: { model?: string }) {
+        return texts.map((_text, index) => index === 0
+          ? { embedding: [1, 2, 3], model: "fake-embed" }
+          : null
+        );
+      },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", {
+        name: "retry-doc",
+        body: "# Retry doc\n\n" + "transient embedding failure ".repeat(260),
+      });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.errors).toBe(0);
+      expect(result.failures).toEqual([]);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: result.chunksEmbedded });
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
