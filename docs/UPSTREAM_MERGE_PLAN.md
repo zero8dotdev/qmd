@@ -27,7 +27,8 @@ The §3 concurrency bug is fixed and the fix is verified end-to-end (see
 
 | Repo | Ref | Commit |
 |---|---|---|
-| Fork (zero8dotdev/qmd) | `origin/main` | `da67604` |
+| Fork (zero8dotdev/qmd) | `origin/main` | `4e591f5` |
+| Smriti submodule pointed at | (stale) | `da67604` |
 | Upstream (tobi/qmd) | `upstream/main` | `dbfd0b4` (2026-08-18) |
 | Smriti submodule pointer | `qmd` (gitlink) | `da67604` |
 
@@ -35,11 +36,21 @@ The §3 concurrency bug is fixed and the fix is verified end-to-end (see
 git rev-list --left-right --count HEAD...upstream/main   # 1  155
 ```
 
-**Not a pure fast-forward this time.** Unlike May, the fork carries one commit
-that upstream does not: `da67604 docs: upstream merge plan and outcome (May 2026)`
-— a fork-local documentation commit touching only `docs/`. It cannot conflict
-with upstream source. Rebase it onto `upstream/main` rather than merging, to
-keep the fork a linear superset of upstream.
+**Not a fast-forward, and not a rebase either.** Two things differ from May:
+
+1. The fork carries `da67604 docs: upstream merge plan and outcome (May 2026)`,
+   a fork-local documentation commit touching only `docs/`.
+2. **`origin/main` has moved independently.** Someone merged `tobi:main` into the
+   fork through the GitHub UI (`4e591f5 Merge branch 'tobi:main' into main`),
+   bringing it to roughly v2.6.3. The Smriti submodule pointer was never updated
+   and still referenced `da67604`, which is why the drift measured 155 commits
+   from the submodule's perspective but only 88 from `origin/main`'s.
+
+`da67604` **is** an ancestor of `origin/main`, so no history rewrite is needed —
+and a rebase onto `upstream/main` would be actively wrong here: it would drop
+`4e591f5` and require a force-push that discards someone else's merge. Merge
+`upstream/main` into `origin/main` instead. The fork has no source divergence
+from upstream, only merge topology, so the merge is clean.
 
 ### Version span
 
@@ -201,17 +212,21 @@ cd qmd
 
 git fetch upstream main && git fetch origin
 
-# Rebase the single fork-local docs commit onto upstream (not a merge —
-# keeps the fork a linear superset).
-git checkout -B sync-upstream-2026-08 main
-git rebase upstream/main
-# Expect: 1 commit replayed, docs/ only, no conflicts.
-# If source files conflict, STOP — the fork has divergence this plan
-# did not account for. Re-audit before continuing.
+# ALWAYS branch from origin/main, never from the submodule's current HEAD —
+# the submodule pointer can lag behind pushes made to the fork elsewhere.
+git checkout -B sync-upstream-2026-08 origin/main
+git merge upstream/main
+# Expect: clean merge. The fork has no source divergence from upstream.
+# If source files conflict, STOP and re-audit — that means someone has
+# committed source to the fork.
 
 bun install
 bun run test:unit          # Node/Vitest + Bun, per upstream's package.json
 ```
+
+> **Do not rebase onto `upstream/main`.** It drops the fork's own merge commits
+> and turns the push into a force-push over other people's work. This plan was
+> drafted with a rebase and corrected during execution — see §7.
 
 ### Phase B — Smriti-side change
 
@@ -235,8 +250,8 @@ git commit -m "chore(qmd): bump submodule to upstream main (dbfd0b4)"
 cd qmd && git push origin sync-upstream-2026-08:main
 ```
 
-Not a fast-forward — the rebase rewrites `da67604`. Coordinate before pushing;
-see §7.
+Fast-forward from `origin/main` (`4e591f5`), so no force and nothing to
+coordinate around.
 
 ---
 
@@ -332,21 +347,35 @@ Carried forward from May, plus new items:
 
 ## 7. Rollback Plan
 
-Phase A is a rebase, so the fork move is **not** a fast-forward this time.
+Phase A is a merge that fast-forwards `origin/main`, so rollback is a normal
+revert — no history rewrite, no force-push.
 
 ```bash
 # Fork rollback
 cd qmd
-git push origin --force-with-lease da67604:main
+git revert -m 1 <merge-commit>
 
 # Smriti rollback (submodule pointer reverts cleanly)
 cd ../
 git revert <submodule-bump-commit>
 ```
 
-`--force-with-lease` refuses if anyone has pushed since. Because Phase D rewrites
-`da67604`, anyone holding that commit must reset rather than pull. Confirm no one
-else is on the fork before pushing.
+### Correction made during execution (2026-08-25)
+
+This plan was first drafted specifying a **rebase** onto `upstream/main`, on the
+assumption — carried over from May — that the fork's `origin/main` was still at
+`da67604`. It was not. `git ls-remote origin main` returned `4e591f5`, a
+`Merge branch 'tobi:main' into main` made through the GitHub UI. Rebasing and
+pushing would have discarded it.
+
+The rebase was executed locally before this was caught (branch
+`sync-upstream-2026-08`, abandoned), and redone as a merge from `origin/main`
+(branch `sync-upstream-2026-08-v2`). Nothing was pushed in between.
+
+**Lesson for the next sync, now folded into Phase A:** branch from `origin/main`,
+not from whatever commit the submodule happens to point at. A stale submodule
+pointer makes the fork look further behind than it is and hides pushes made
+elsewhere.
 
 ---
 
