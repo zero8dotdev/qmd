@@ -1,10 +1,10 @@
-# Upstream Merge Plan — May 2026
+# Upstream Merge Plan — August 2026
 
-**Goal:** Bring `zero8dotdev/qmd` (fork) `main` from `d58fedf` up to `tobi/qmd` `main` at `ddbd6bd` (49 commits behind), then bump the submodule pointer in Smriti.
+**Goal:** Bring `zero8dotdev/qmd` (fork) `main` from `da67604` up to `tobi/qmd` `main` at `dbfd0b4` (155 commits behind, 1 ahead), then bump the submodule pointer in Smriti.
 
-**Drafted:** 2026-05-18 · **Executed:** 2026-05-18 · **Status:** Complete
+**Drafted:** 2026-08-25 · **Executed:** _pending_ · **Status:** _in progress_
 
-**Outcome:** Fork main fast-forwarded from `d58fedf` to `ddbd6bd`. QMD test suite: 868 pass / 0 fail. Stale branches `perf/addmessage-upsert-opt` and `refactor/move-memory-ollama-to-smriti` deleted from origin. Note: QMD process exits with SIGABRT on macOS due to a known Metal device cleanup issue during atexit (not a test regression — all tests pass before exit).
+**Previous sync:** [UPSTREAM_MERGE_PLAN-2026-05.md](./UPSTREAM_MERGE_PLAN-2026-05.md) (49 commits, `d58fedf` → `ddbd6bd`, clean fast-forward)
 
 ---
 
@@ -12,200 +12,304 @@
 
 | Repo | Ref | Commit |
 |---|---|---|
-| Fork (zero8dotdev/qmd) | `origin/main` | `d58fedf` |
-| Upstream (tobi/qmd) | `upstream/main` | `ddbd6bd` |
-| Smriti submodule pointer | `qmd` (gitlink) | `d58fedf` |
-
-**Critical finding:** `origin/main` is a **pure ancestor** of `upstream/main` — zero fork-specific commits on main. This is a clean fast-forward at the Git level.
+| Fork (zero8dotdev/qmd) | `origin/main` | `da67604` |
+| Upstream (tobi/qmd) | `upstream/main` | `dbfd0b4` (2026-08-18) |
+| Smriti submodule pointer | `qmd` (gitlink) | `da67604` |
 
 ```bash
-# Verified:
-git log --oneline upstream/main..origin/main   # empty
-git merge-base origin/main upstream/main       # = d58fedf
+git rev-list --left-right --count HEAD...upstream/main   # 1  155
 ```
 
-### Other fork branches (stale, will be deleted)
+**Not a pure fast-forward this time.** Unlike May, the fork carries one commit
+that upstream does not: `da67604 docs: upstream merge plan and outcome (May 2026)`
+— a fork-local documentation commit touching only `docs/`. It cannot conflict
+with upstream source. Rebase it onto `upstream/main` rather than merging, to
+keep the fork a linear superset of upstream.
 
-| Branch | Status | Reason |
-|---|---|---|
-| `origin/perf/addmessage-upsert-opt` | Stale | Adds `memory.ts`/`ollama.ts` to QMD — both modules have since moved to `smriti/src/`. Obsolete. |
-| `origin/refactor/move-memory-ollama-to-smriti` | Stale | The move it describes is already complete in Smriti. Obsolete. |
-| Local `main` (commit `7ec50b8`) | Stale | Predates the modules-to-smriti move. **Diverged from `origin/main` — must be reset, not merged.** |
-| Local `sync-upstream` | Use for this work | Repurpose or recreate from `origin/main`. |
+### Version span
+
+`v2.1.0` → `v2.8.3`, covering `2.5.0`, `2.5.1`, `2.5.2`, `2.5.3`, `2.6.3`, `2.8.3`.
 
 ---
 
-## 2. What's Changing (49 Upstream Commits)
+## 2. What's Changing (155 Upstream Commits)
 
-### Categories
+### Churn in the files Smriti imports from
 
-| Type | Count | Examples |
+| File | Δ lines | Why it matters |
 |---|---|---|
-| Search/RRF correctness | 3 | `004714a` RRF weighting by query type, `d045a8b` CJK FTS, `5b9f472` embed collection filter |
-| Stability / GPU | 6 | `60c75cb` Metal cleanup abort, `e8229d8` Windows CUDA parallelism, `1f75737` GPU status |
-| Embedding | 4 | `910ca07` partial embeddings pending, `b59ba6a` cleanup lifecycle, model resolution |
-| CLI / MCP UX | 8 | `c18c74a` serve QMD skill from CLI, `9cecdc8` terse MCP collection summary, `e36ab96` HTTP rerank control |
-| Path / docid | 4 | `dff6513` preserve docids across case renames, `2dc8634` qmd:/// aliases, `aa1818e` clamp fromLine |
-| Bench / test infra | 6 | `2e0c743` local-index bench, Node+Bun matrix, lifecycle regression |
-| Routine merges | 18 | First-parent merges of the above |
+| `src/store.ts` | +1881 / −365 | Smriti imports 5 symbols + 1 type from here |
+| `src/db.ts` | +86 | `openDatabase`, `Database`/`Statement` types |
+| `src/index.ts` | +27 | `createStore`, `QMDStore` |
+| `src/collections.ts` | +7 | not consumed by Smriti |
+
+Non-consumed churn (`cli/qmd.ts` +2212, `mcp/server.ts` +636, `llm.ts` +604,
+new `trust.ts`, `mcp/origin-guard.ts`, `cli/embed-lock.ts`, `cli/version.ts`,
+`cli/mcp-pid.ts`) is CLI/MCP surface. Smriti consumes QMD as a library and is
+unaffected.
 
 ### Risk Audit: APIs Smriti Imports from QMD
 
-Smriti consumes QMD via the vendored submodule and imports these symbols directly from `../qmd/src/store.ts`, `../qmd/src/index.ts`, `../qmd/src/db.ts`:
+Consumed surface, verified against `smriti/src/`:
 
 ```
-createStore, QMDStore                       — src/db.ts, src/store.ts
-initializeMemoryTables                       — src/qmd.ts (re-export from smriti/src/memory.ts)
-hashContent                                  — src/qmd.ts, src/team/share.ts, src/team/sync.ts
-chunkDocumentByTokens, reciprocalRankFusion  — src/memory.ts
-formatQueryForEmbedding, formatDocForEmbedding, RankedResult — src/memory.ts
-insertEmbedding                              — src/memory.ts
-Database (type)                              — src/db.ts, src/memory.ts
+createStore, QMDStore                       — src/db.ts:15, src/store.ts:9
+hashContent                                  — src/qmd.ts, src/memory.ts, src/team/{share,sync}.ts
+chunkDocumentByTokens, reciprocalRankFusion  — src/memory.ts:20-21
+formatQueryForEmbedding, formatDocForEmbedding, RankedResult — src/memory.ts:22-24
+insertEmbedding (via store.internal)         — src/memory.ts:625,640
+Database (type)                              — src/db.ts:17 (type-only), src/memory.ts:17
 ```
 
-**Diff scan of these symbols across the 49 commits:**
+**Export-surface diff of `src/store.ts`:** 23 exports added, **0 removed, 0 renamed.**
 
 | Symbol | Change | Smriti impact |
 |---|---|---|
-| `insertEmbedding` | Added optional 7th param `totalChunks?: number` | None — backward compatible. Smriti's callsites continue to work; new behavior (partial-embedding pending state from `910ca07`) is opt-in. |
-| `formatQueryForEmbedding` | Callsite refactor only (passes resolved `embedModel` instead of `llm.embedModelName`). Signature unchanged. | None. |
-| `reciprocalRankFusion` | Unchanged. **But `hybridQuery` now weights "original"-type lists at 2x via `getHybridRrfWeights` (commit `004714a`).** | **Improvement.** Smriti calls `reciprocalRankFusion` directly with its own weights — unaffected. QMD callers of `hybridQuery` get better rankings. |
-| `createStore`, `QMDStore`, `hashContent`, `chunkDocumentByTokens`, `formatDocForEmbedding`, `RankedResult`, `initializeMemoryTables`, `Database` | No signature or semantic change. | None. |
+| `hashContent` | Unchanged. | None. |
+| `chunkDocumentByTokens` | Signature byte-identical (7 params, `signal?: AbortSignal` still last). | None. |
+| `reciprocalRankFusion` | Function body byte-identical. | None. See §6 for the caller-side weighting fix. |
+| `formatQueryForEmbedding`, `formatDocForEmbedding` | Re-export line unchanged; callsite refactors only. | None. |
+| `insertEmbedding` | **Added optional 9th param** `fingerprint: string = getEmbeddingFingerprint(model)`. Body now wrapped in `withLazyContentVectorMigration`. | **None, and a free improvement.** Smriti's two callsites pass 7 args; the default computes a correct fingerprint automatically, so Smriti's vectors become properly fingerprinted with no code change. |
+| `openDatabase` | **Now sets `PRAGMA busy_timeout` (default 120 000 ms, `QMD_SQLITE_BUSY_TIMEOUT`) and performs a retrying `journal_mode = WAL` migration.** WAL moved here from `store.ts:818`. | **Fixes a live Smriti bug.** See §3. |
+| `Database.transaction` (type) | Narrowed `<T extends (...args: any[]) => any>` → `<T extends (...args: SQLiteValue[]) => unknown>`, returns `T & { immediate: T }`. | **None.** `grep -rn "\.transaction(" smriti/src/` returns nothing. |
+| `Statement.run/get/all` (types) | `any[]` → `SQLiteParams` (`string \| number \| bigint \| Buffer \| Uint8Array \| Float32Array \| null`). | **None.** Smriti's widest call is `.all(new Float32Array(...), limit * 3)` (`memory.ts:498`) — `Float32Array` is in the union. |
+| `createStore`, `QMDStore`, `RankedResult` | No signature or semantic change. | None. |
 
-**Conclusion: zero breaking changes for Smriti.**
+**Conclusion: zero breaking changes for Smriti.** Same verdict as May, now with
+one schema change to account for (below).
+
+### Schema change: `content_vectors`
+
+Upstream adds a column to a table Smriti reads, writes and garbage-collects:
+
+```sql
+CREATE TABLE IF NOT EXISTS content_vectors (
+  hash TEXT NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  pos INTEGER NOT NULL DEFAULT 0,
+  model TEXT NOT NULL,
+  embed_fingerprint TEXT NOT NULL DEFAULT '',   -- NEW
+  total_chunks INTEGER NOT NULL DEFAULT 1,
+  embedded_at TEXT NOT NULL,
+  PRIMARY KEY (hash, seq)
+)
+```
+
+The fingerprint is derived from the active embed model plus formatting/chunking
+parameters, so vectors are treated as stale-pending when search semantics change.
+Migration is lazy (`withLazyContentVectorMigration`) to preserve fast startup.
+
+Smriti's touchpoints — all safe:
+
+- `memory.ts:625,640` write via `insertEmbedding` → fingerprint auto-populated.
+- `memory.ts:526,586` read with explicit column lists / `JOIN` → unaffected by an added column.
+- `memory.ts:273-293` orphan cleanup uses `hash`/`seq` only → unaffected.
+
+Pre-existing rows keep `embed_fingerprint = ''` and are treated as legacy;
+`maybeAdoptLegacyEmbeddingFingerprint` handles safe adoption.
 
 ### Behavioral changes worth knowing
 
-- **CJK FTS migration (`d045a8b`):** First post-merge call into `documents_fts` rebuilds the FTS table to space-separate CJK characters. **One-time, on-disk migration** in `~/.cache/qmd/index.sqlite`. Smriti's recall path uses its own `memory_fts` table (separate from `documents_fts`), so Smriti recall is unaffected. Direct `qmd` CLI users will see a brief one-time delay on first query.
-- **RRF weighting fix (`004714a`):** Affects QMD's `hybridQuery` only. Smriti's `searchMemoryFTS` / `searchMemoryVec` / RRF fusion is a separate code path — not directly improved, but the new `getHybridRrfWeights` helper is a pattern worth porting later (see Future Work).
-- **Docid stability (`dff6513`):** Case-only renames now preserve docid. Smriti stores docids inside session messages — pre-merge docids remain valid post-merge.
-- **Partial embeddings pending (`910ca07`):** Crash mid-embedding-batch now leaves chunks marked pending instead of orphaning the document. Smriti doesn't use QMD's embed batch (uses its own loop), no impact.
+- **Concurrency (2.6.3, 2.8.3).** `busy_timeout` + retrying WAL in `openDatabase`;
+  FTS trigger setup gated behind `PRAGMA user_version` inside one `IMMEDIATE`
+  transaction; concurrent cold-open `table documents_fts already exists` fixed
+  (reported specifically on **Bun/macOS** — Smriti's runtime and platform).
+- **Embed durability (2.5.0, 2.6.3).** Complete-chunk-coverage required before a
+  document counts as embedded; partial vectors removed after an interrupted
+  session; per-chunk failure retained and retried; the hardcoded 30-minute embed
+  ceiling is now `QMD_EMBED_MAX_DURATION_MS` / `--timeout` (#673).
+- **Retrieval (#563, #690, #775, #799).** FTS5 now matches dotted version strings
+  (`2026.4.10` was sanitized to `2026410`); `searchVec` embeds with the store's
+  pinned model rather than global `QMD_EMBED_MODEL`; multi-collection search runs
+  per-collection then merges instead of search-globally-then-post-filter;
+  embedding-context pool sized from the weight file instead of a flat 150 MB.
+- **macOS Metal exit (2.5.3).** The SIGABRT recorded as a known issue in the May
+  plan's Outcome is fixed: `finishSuccessfulCliCommand` sets `process.exitCode`
+  instead of calling `process.exit(0)`, so `beforeExit` fires and native contexts
+  dispose before libc's static destructor. Defense-in-depth `GGML_METAL_NO_RESIDENCY=1`
+  is set in `bin/qmd`, which Smriti does not use — see §6.
+- **node-llama-cpp 3.18.1 → 3.20.0.** `LlamaContextSequence.dispose()` became
+  async; upstream now awaits it before disposing the parent context. Smriti pins
+  `^3.0.0` and will float into 3.20 on its next `bun install`.
+- **Security (2.8.3).** Project-local `.qmd/index.yml` `update:` commands, out-of-
+  project collection paths and non-default model URIs are now behind a trust gate;
+  indexing no longer follows file symlinks or `../` globs out of the collection;
+  `qmd mcp --http` validates `Origin`/`Host`. None of these paths are reachable
+  from Smriti, but see §6 for the `.smriti/` parallel.
 
 ---
 
-## 3. Execution Plan
+## 3. The Bug This Merge Fixes in Smriti
+
+`smriti/src/db.ts:724` opens the database like this:
+
+```
+initSmriti()
+  └─ createStore()                      ← QMD opens the DB, runs initializeDatabase():
+      ├─ PRAGMA journal_mode = WAL         (fork store.ts:818 — no retry)
+      ├─ FTS trigger DROP + CREATE
+      └─ schema migrations                 ... all with busy_timeout = 0
+  └─ db.exec("PRAGMA busy_timeout = 5000") ← arrives AFTER the risky section
+```
+
+Smriti can only set the pragma on the handle `createStore()` returns, so the
+cold-open DDL runs unprotected. `bun:sqlite` defaults `busy_timeout` to 0, so a
+loser in that race throws immediately rather than queueing.
+
+**Why the daemon makes this reachable rather than theoretical.** QMD has no
+daemon; Smriti does. `defaultFlushAgent` (`src/daemon/index.ts`) opens the store,
+ingests, and closes it **per flush**, so a watching daemon re-runs `createStore()`
+— and therefore the whole cold-open path — on every debounced file change, for as
+long as it is installed. `flushChain` serializes flushes, but only *within* the
+daemon process, and there is no cross-process lock anywhere in `src/daemon/`,
+`src/db.ts` or `src/store.ts`. The Stop hook's `lockf` guards ingest-against-ingest
+only, and only on the daemon-down fallback path. The unguarded race is
+daemon-flush against a foreground `smriti recall` / `embed` / `ingest`.
+
+**Fix ownership: QMD, not Smriti.** `openDatabase` is the only place that runs
+before the DDL, and upstream's version is byte-identical to what Smriti needs, so
+taking it costs zero fork divergence. Upstream's 120 s default was sized for a
+long `embed` batch commit — the same contention a flush produces.
+
+**Smriti-side change:** delete the now-redundant, too-late pragma at
+`smriti/src/db.ts:737` and let `openDatabase` own it. Tune via
+`QMD_SQLITE_BUSY_TIMEOUT` if a shorter fail-fast is ever wanted.
+
+---
+
+## 4. Execution Plan
 
 ### Phase A — Fork repo (`zero8dotdev/qmd`)
 
 ```bash
 cd qmd
 
-# 1. Confirm upstream is current
-git fetch upstream main
-git fetch origin
+git fetch upstream main && git fetch origin
 
-# 2. Move to a working branch off origin/main
-git checkout -B sync-upstream-2026-05 origin/main
+# Rebase the single fork-local docs commit onto upstream (not a merge —
+# keeps the fork a linear superset).
+git checkout -B sync-upstream-2026-08 main
+git rebase upstream/main
+# Expect: 1 commit replayed, docs/ only, no conflicts.
+# If source files conflict, STOP — the fork has divergence this plan
+# did not account for. Re-audit before continuing.
 
-# 3. Fast-forward to upstream/main
-git merge --ff-only upstream/main
-# ↑ MUST succeed without manual conflict resolution. If it fails,
-#   re-verify that origin/main has no commits not in upstream/main:
-#     git log --oneline upstream/main..origin/main
-#   Should be empty. If non-empty, stop and re-plan.
-
-# 4. Run the QMD test suite locally before pushing
 bun install
-bun test --preload ./src/test-preload.ts test/
-
-# 5. Push to fork main (fast-forward push, no force needed)
-git push origin sync-upstream-2026-05:main
+bun run test:unit          # Node/Vitest + Bun, per upstream's package.json
 ```
 
-### Phase B — Cleanup stale branches
+### Phase B — Smriti-side change
 
-```bash
-# Delete obsolete fork branches (after confirming nothing depends on them)
-git push origin --delete perf/addmessage-upsert-opt
-git push origin --delete refactor/move-memory-ollama-to-smriti
-
-# Local cleanup
-git branch -D main           # local main is stale (7ec50b8) — recreate
-git checkout main            # tracks origin/main, now at ddbd6bd
-git branch -D sync-upstream  # if no longer needed
-```
-
-### Phase C — Smriti submodule bump
+Remove the redundant pragma now owned by `openDatabase` (§3), then:
 
 ```bash
 cd /Users/zero8/zero8.dev/smriti
-
-# 1. Update submodule pointer
-git submodule update --remote qmd
-# OR explicit:
-#   cd qmd && git checkout main && git pull && cd ..
-
-# 2. Reinstall (file: dep resolves the new commit)
 bun install
-
-# 3. Run Smriti's full test suite — this is the real gate
-bun test
-
-# 4. Smoke-test the CLI surfaces that touch QMD search:
-bun src/index.ts recall "test query" --check-conflicts
-bun src/index.ts search "test query"
-bun src/index.ts status
-
-# 5. Commit the submodule bump
-git add qmd bun.lock
-git commit -m "chore(qmd): bump submodule to upstream main (ddbd6bd)
-
-Pulls 49 upstream commits including RRF weighting fix (#004714a),
-CJK FTS support (#d045a8b), embed collection filter fix (#5b9f472),
-and macOS Metal cleanup stability (#60c75cb).
-
-No breaking changes to APIs consumed by Smriti."
 ```
+
+### Phase C — Verification (§5), then commit the submodule bump
+
+```bash
+git add qmd bun.lock src/db.ts
+git commit -m "chore(qmd): bump submodule to upstream main (dbfd0b4)"
+```
+
+### Phase D — Push (requires explicit sign-off)
+
+```bash
+cd qmd && git push origin sync-upstream-2026-08:main
+```
+
+Not a fast-forward — the rebase rewrites `da67604`. Coordinate before pushing;
+see §7.
 
 ---
 
-## 4. Verification Gates
+## 5. Verification Gates
 
 A merge is **only accepted** when all of these pass:
 
-1. **QMD's own test suite** — `bun test --preload ./src/test-preload.ts test/` in `qmd/`
-2. **Smriti's full test suite** — `bun test` in `smriti/`
+1. **QMD's own test suite** — `bun run test:unit` in `qmd/`
+2. **Smriti's full test suite** — `bun test --cwd ./test` in `smriti/`.
+   **Baseline recorded 2026-08-25 before the merge: 408 pass / 0 fail across 35 files.**
 3. **Type check** — `bunx tsc --noEmit` in `smriti/` (imports from `../qmd/src/...` must still resolve)
-4. **Smoke tests** for the three surfaces that touch QMD:
+4. **Recall quality eval** — `bun run eval:recall` before and after. This is the
+   gate for the retrieval changes; a ranking regression will not show up in unit tests.
+5. **Smoke tests** for the three surfaces that touch QMD:
    - `smriti search` (FTS + Vec via `searchMemoryFTS` / `searchMemoryVec`)
    - `smriti recall` (RRF via `reciprocalRankFusion`)
    - `smriti ingest claude` (writes via `addMessage` / `hashContent` / `insertEmbedding`)
-5. **CHANGELOG note** in Smriti's CHANGELOG if it exists
+6. **Concurrency smoke** — new for this sync, since §3 is the headline fix:
+   run `smriti daemon` and a foreground `smriti recall` loop simultaneously
+   against the same DB and confirm no `database is locked` /
+   `trigger documents_ai already exists` / `table documents_fts already exists`.
 
-If anything fails: do not push. Revert the submodule bump and triage.
+If anything fails: do not push. Reset the submodule pointer and triage.
 
 ---
 
-## 5. Rollback Plan
+## 6. Future Work (Out of Scope for This Merge)
 
-The fork main move is a fast-forward push — easy to revert if a regression slips through:
+Carried forward from May, plus new items:
+
+- **[carried] Port the `getHybridRrfWeights` pattern to Smriti recall.** Still
+  open. Smriti calls `reciprocalRankFusion` at `src/memory.ts:803` with its own
+  positional `rankWeights`, which is the same shape as pre-fix QMD: when query
+  expansion runs first, expansion-derived lists can steal the original query's
+  intended 2× weight. `bun run eval:recall` is the instrument.
+- **[new] Replace the post-filter overfetch in `searchFiltered` with per-scope
+  search + merge.** Smriti's `limit * 3` overfetch (`memory.ts:408`, `:498`) is
+  structurally the bug upstream fixed in #775: a large unrelated slice can fill
+  the FTS/ANN top-k so a narrow `--project` / `--category` / `--agent` filter
+  returns false-empty even when that project has plenty of matches. Upstream's
+  per-collection-then-merge is the shape to port.
+- **[new] Surface embedding-fingerprint health in `smriti status`.** Upstream's
+  `qmd doctor` reports per-fingerprint document/chunk breakdown and warns on mixed
+  fingerprints. Smriti has no equivalent; today, changing the embed model silently
+  mixes incompatible vectors.
+- **[new] Set `GGML_METAL_NO_RESIDENCY=1` in Smriti's own entry point.** Upstream
+  sets it in `bin/qmd`, which Smriti does not go through. It must be set *before*
+  the process starts — Bun does not propagate `process.env` mutations to libc
+  `setenv`, and libggml-metal reads it via `getenv` at module load — so a preload
+  will not work.
+- **[new] Audit `smriti sync` against upstream's trust-gate threat model.**
+  2.8.3 exists because a `.qmd/index.yml` arriving via `git clone` was adopted
+  automatically and its `update:` commands executed. `.smriti/` has the same
+  shape: config and knowledge that arrive with a clone and are auto-discovered
+  via `.smriti/CLAUDE.md`, plus `.smriti/prompts/share-reflect.md` — a prompt
+  file from a cloned repo fed to a local LLM. `isPathInsideDir` is now exported
+  if a containment check is wanted.
+- **[carried] Reconsider keeping QMD as a submodule.** The fork is still zero-
+  divergence on source (the only fork commit is documentation). If it stays that
+  way, `"qmd": "github:tobi/qmd#<commit>"` would drop the fork entirely.
+
+---
+
+## 7. Rollback Plan
+
+Phase A is a rebase, so the fork move is **not** a fast-forward this time.
 
 ```bash
-# Fork rollback (force-push back to d58fedf — only on main if no one else has pulled)
+# Fork rollback
 cd qmd
-git push origin --force-with-lease d58fedf:main
+git push origin --force-with-lease da67604:main
 
 # Smriti rollback (submodule pointer reverts cleanly)
 cd ../
 git revert <submodule-bump-commit>
 ```
 
-`--force-with-lease` is required because we're rewriting a fast-forward; refuses if anyone has pushed since. Coordinate with team before doing this.
+`--force-with-lease` refuses if anyone has pushed since. Because Phase D rewrites
+`da67604`, anyone holding that commit must reset rather than pull. Confirm no one
+else is on the fork before pushing.
 
 ---
 
-## 6. Future Work (Out of Scope for This Merge)
+## 8. Open Questions
 
-These are improvements to consider after the merge lands, not blockers:
-
-- **Port `getHybridRrfWeights` pattern to Smriti recall.** Smriti's RRF fusion uses positional weights similar to the pre-fix QMD logic. Same bug class applies — when query expansion runs first, expansion-derived lists can steal the original-query weight. Worth fixing in `smriti/src/memory.ts` and `src/search/recall.ts`.
-- **Reconsider keeping QMD as a submodule vs. upstreaming Smriti's QMD usage as a stable consumer.** The fork has zero divergence — if it stays that way, switch to `"qmd": "github:tobi/qmd#<commit>"` and drop the fork entirely.
-- **Wire the `--check-conflicts` recall path through `hybridQuery` instead of separate FTS+Vec+RRF.** Would get the upstream RRF fix for free.
-
----
-
-## 7. Open Questions
-
-- [ ] Is anything in the codebase still consuming `perf/addmessage-upsert-opt` or `refactor/move-memory-ollama-to-smriti`? (Check before deleting.)
-- [ ] Do we want to tag the fork at `v2.1.0-sync-2026-05` for traceability, or just rely on the commit hash in Smriti's submodule pointer?
-- [ ] Should the QMD test suite run in CI for this fork, or only at sync time?
+- [ ] Push Phase A to `origin/main`, or keep the sync local until the Future Work
+      retrieval items land too?
+- [ ] Keep Smriti's `busy_timeout` override at a shorter value than upstream's
+      120 s default, or adopt the default outright?
+- [ ] Should `bun run eval:recall` become a CI gate rather than a manual sync-time step?
+- [ ] Tag the fork at `v2.8.3-sync-2026-08` for traceability?
