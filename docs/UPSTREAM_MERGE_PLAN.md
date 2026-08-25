@@ -2,7 +2,22 @@
 
 **Goal:** Bring `zero8dotdev/qmd` (fork) `main` from `da67604` up to `tobi/qmd` `main` at `dbfd0b4` (155 commits behind, 1 ahead), then bump the submodule pointer in Smriti.
 
-**Drafted:** 2026-08-25 · **Executed:** _pending_ · **Status:** _in progress_
+**Drafted:** 2026-08-25 · **Executed:** 2026-08-25 · **Status:** Complete (local; Phase D not pushed)
+
+**Outcome:** Fork rebased `da67604` → `eafa47e` on top of `upstream/main` (`dbfd0b4`).
+The rebase replayed 2 documentation commits with **zero conflicts**; `git diff
+upstream/main HEAD --stat` is docs-only (2 files, 526 insertions, **no source
+lines**), so the fork remains a pure documentation superset of upstream.
+
+QMD suite: 1219 pass / 2 fail. Both failures are in `test/mcp.test.ts` (MCP HTTP
+Transport, 2025-era client initialize) and are **pre-existing upstream** — proven
+by the docs-only delta above. MCP HTTP is not a surface Smriti consumes. QMD
+type-checks clean under its own `tsconfig.build.json`.
+
+Smriti suite: **408 pass / 0 fail**, identical to the pre-merge baseline.
+
+The §3 concurrency bug is fixed and the fix is verified end-to-end (see
+§5 gate 6 results below).
 
 **Previous sync:** [UPSTREAM_MERGE_PLAN-2026-05.md](./UPSTREAM_MERGE_PLAN-2026-05.md) (49 commits, `d58fedf` → `ddbd6bd`, clean fast-forward)
 
@@ -240,11 +255,41 @@ A merge is **only accepted** when all of these pass:
    - `smriti recall` (RRF via `reciprocalRankFusion`)
    - `smriti ingest claude` (writes via `addMessage` / `hashContent` / `insertEmbedding`)
 6. **Concurrency smoke** — new for this sync, since §3 is the headline fix:
-   run `smriti daemon` and a foreground `smriti recall` loop simultaneously
-   against the same DB and confirm no `database is locked` /
-   `trigger documents_ai already exists` / `table documents_fts already exists`.
+   N processes calling `initSmriti()` on the same cold DB simultaneously,
+   confirming no `database is locked` / `trigger documents_ai already exists` /
+   `table documents_fts already exists`.
 
 If anything fails: do not push. Reset the submodule pointer and triage.
+
+### Results — 2026-08-25
+
+| Gate | Pre-merge | Post-merge |
+|---|---|---|
+| 1. QMD suite | not run | 1219 pass / 2 fail (both pre-existing upstream, MCP HTTP) |
+| 2. Smriti suite | **408 pass / 0 fail** | **408 pass / 0 fail** |
+| 3. Type check | n/a — see note | QMD clean under `tsconfig.build.json` |
+| 4. `eval:recall` | 5/6, recall 1.00, precision 0.90 | 5/6, recall 1.00, precision 0.90 — **no change** |
+| 5. Smoke (`status`/`search`/`recall`) | — | all three pass against the live 3 446-session DB |
+| 6. Concurrency (6 concurrent cold opens) | **1/6 succeeded**, 5 × `SQLiteError: database is locked` | **6/6 succeeded**, zero errors |
+
+Gate 6 is the headline result: the race was reproduced against the pre-merge
+submodule and is gone after it. Post-merge pragma state on a fresh DB:
+
+```
+busy_timeout  = 120000        (was 0 during cold-open DDL, then 5000)
+journal_mode  = wal           (via the retrying migration)
+content_vectors = hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at
+```
+
+**Gate 4 note.** `eval:recall` is unchanged pre/post, which is the expected
+result rather than a disappointing one: upstream's retrieval fixes (#775, and
+the `getHybridRrfWeights` caller-side weighting) live in QMD's own `hybridQuery`
+/ `searchFTS` paths, while Smriti fuses its own lists in `src/memory.ts`. The
+merge does not deliver them — they remain the §6 Future Work items.
+
+**Gate 3 note.** Smriti has **no `tsconfig.json`**, so the May plan's
+`bunx tsc --noEmit` gate silently printed the compiler help text and checked
+nothing. It has never run. Adding one is worth a follow-up.
 
 ---
 
